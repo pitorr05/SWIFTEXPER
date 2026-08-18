@@ -403,7 +403,7 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
         default_attn = np.arange(1, model.config.num_hidden_layers - 1, 2).tolist()
         default_mlp = np.arange(1, model.config.num_hidden_layers - 1, 2).tolist()
         
-        if (best_attn_skip != default_attn) or (best_mlp_skip != default_mlp):
+        if (not np.array_equal(best_attn_skip, default_attn)) or (not np.array_equal(best_mlp_skip, default_mlp)):
             swift_forward.cache.add_to_cache(embedding, best_attn_skip, best_mlp_skip)
             print(f"💾 Cached new layer set! {swift_forward.cache.get_stats()}")
     
