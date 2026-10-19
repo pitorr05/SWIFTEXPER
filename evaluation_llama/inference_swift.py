@@ -4,8 +4,9 @@ Usage:
 python3 gen_model_answer.py --model-path lmsys/fastchat-t5-3b-v1.0 --model-id fastchat-t5-3b-v1.0
 """
 import argparse
-import numpy as np
-from collections import OrderedDict
+import time
+from pathlib import Path
+from evaluation_llama.adaptive_cache import AdaptiveCache
 
 from fastchat.utils import str_to_torch_dtype
 
@@ -18,274 +19,13 @@ from model.swift.utils import *
 from model.swift.modeling_llama import LlamaForCausalLM
 from model.swift.kv_cache import initialize_past_key_values
 
-
-# ============================================
-# ADAPTIVE CACHE CLASS
-# ============================================
-
-class AdaptiveCache:
-    """
-    Bộ nhớ đệm layer set thích ứng cho SWIFT.
-    
-    Design Principles:
-    1. Online Learning: Cache được xây dựng trong lúc chạy, không cần pre-inference
-    2. Plug-and-Play: Cache rỗng khi khởi tạo, tự động học
-    3. LRU Eviction: Giới hạn kích thước cache để tránh tràn bộ nhớ
-    4. Cosine Similarity: Dùng để tìm layer set tương tự nhất
-    
-    Attributes:
-        cache (OrderedDict): Lưu {embedding_tuple: (attn_skip, mlp_skip)}
-        max_size (int): Số lượng entry tối đa trong cache
-        threshold (float): Ngưỡng cosine similarity để cache HIT
-        hit_count, miss_count (int): Thống kê hiệu suất
-    """
-    
-    def __init__(self, max_size: int = 100, similarity_threshold: float = 0.85):
-        self.cache = OrderedDict()
-        self.max_size = max_size
-        self.threshold = similarity_threshold
-        self.hit_count = 0
-        self.miss_count = 0
-        self.total_embedding_time = 0.0
-        self.total_search_time = 0.0
-        
-    def get_embedding(self, input_ids, model) -> np.ndarray:
-        """
-        Trích xuất vector đặc trưng từ input.
-        
-        Tham khảo từ KNN-SSD: sử dụng mean pooling của last hidden state.
-        Đây là cách hiệu quả để capture domain information của input.
-        
-        Args:
-            input_ids: Token IDs của input
-            model: LlamaForCausalLM
-            
-        Returns:
-            embedding: Vector đặc trưng đã được L2-normalized
-        """
-        import time
-        start_time = time.time()
-        
-        with torch.no_grad():
-            # Lấy hidden states từ model
-            outputs = model.model(
-                input_ids=input_ids,
-                output_hidden_states=True,
-                use_cache=False
-            )
-            # Mean pooling theo token dimension
-            embedding = outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
-            # L2 normalization
-            norm = np.linalg.norm(embedding)
-            if norm > 0:
-                embedding = embedding / norm
-        
-        self.total_embedding_time += time.time() - start_time
-        return embedding
-    
-    def find_similar(self, embedding: np.ndarray):
-        """
-        Tìm layer set tương tự nhất trong cache.
-        
-        Sử dụng cosine similarity để so sánh embedding của input 
-        với các embedding đã được cache.
-        
-        Args:
-            embedding: Vector đặc trưng của input mới
-            
-        Returns:
-            tuple: (attn_skip, mlp_skip, similarity) hoặc (None, None, 0.0)
-        """
-        import time
-        start_time = time.time()
-        
-        if not self.cache:
-            self.total_search_time += time.time() - start_time
-            return None, None, 0.0
-        
-        best_similarity = -1.0
-        best_attn = None
-        best_mlp = None
-        
-        for cached_emb_tuple, (attn, mlp) in self.cache.items():
-            cached_emb = np.array(cached_emb_tuple)
-            # Cosine similarity (các vector đã được normalize)
-            similarity = np.dot(embedding, cached_emb)
-            
-            if similarity > best_similarity:
-                best_similarity = similarity
-                best_attn = attn
-                best_mlp = mlp
-        
-        self.total_search_time += time.time() - start_time
-        
-        if best_similarity >= self.threshold and best_attn is not None:
-            self.hit_count += 1
-            # Move to end (LRU)
-            key = tuple(embedding.tolist())
-            if key in self.cache:
-                self.cache.move_to_end(key)
-            return best_attn, best_mlp, best_similarity
-        else:
-            self.miss_count += 1
-            return None, None, best_similarity
-    
-    def add_to_cache(self, embedding: np.ndarray, attn_skip, mlp_skip):
-        """
-        Thêm layer set mới vào cache.
-        
-        Sử dụng LRU eviction: nếu cache đầy, xóa entry lâu nhất không được dùng.
-        
-        Args:
-            embedding: Vector đặc trưng của input
-            attn_skip: Attention layer set
-            mlp_skip: MLP layer set
-        """
-        key = tuple(embedding.tolist())
-        
-        # Kiểm tra trùng lặp
-        if key in self.cache:
-            self.cache.move_to_end(key)
-            return
-        
-        # LRU eviction
-        if len(self.cache) >= self.max_size:
-            self.cache.popitem(last=False)
-        
-        self.cache[key] = (attn_skip, mlp_skip)
-    
-    def get_stats(self) -> str:
-        """Lấy thống kê hiệu suất cache"""
-        total = self.hit_count + self.miss_count
-        if total == 0:
-            return "🔧 Cache: Empty (chưa có dữ liệu)"
-        
-        hit_rate = self.hit_count / total * 100
-        return (f"📊 Cache Stats: {self.hit_count} hits, {self.miss_count} misses, "
-                f"Hit Rate: {hit_rate:.1f}%, "
-                f"Embedding Time: {self.total_embedding_time:.4f}s, "
-                f"Search Time: {self.total_search_time:.4f}s")
-    
-    def clear(self):
-        """Xóa toàn bộ cache"""
-        self.cache.clear()
-        self.hit_count = 0
-        self.miss_count = 0
-        self.total_embedding_time = 0.0
-        self.total_search_time = 0.0
-    
-    def save_to_file(self, filepath: str):
-        """Lưu cache xuống file để tái sử dụng sau"""
-        import json
-        # Convert numpy arrays to lists for JSON serialization
-        cache_data = []
-        for k, (attn, mlp) in self.cache.items():
-            cache_data.append({
-                'embedding': list(k),
-                'attn_skip': list(attn) if isinstance(attn, (list, tuple, np.ndarray)) else attn,
-                'mlp_skip': list(mlp) if isinstance(mlp, (list, tuple, np.ndarray)) else mlp
-            })
-        
-        data = {
-            'cache': cache_data,
-            'hit_count': self.hit_count,
-            'miss_count': self.miss_count,
-            'threshold': self.threshold,
-            'max_size': self.max_size
-        }
-        with open(filepath, 'w') as f:
-            json.dump(data, f, indent=2)
-        print(f"💾 Cache saved to {filepath}")
-    
-    def load_from_file(self, filepath: str):
-        """Load cache từ file"""
-        import json
-        with open(filepath, 'r') as f:
-            data = json.load(f)
-        
-        self.cache = OrderedDict()
-        for item in data['cache']:
-            key = tuple(item['embedding'])
-            attn = item['attn_skip']
-            mlp = item['mlp_skip']
-            self.cache[key] = (attn, mlp)
-        
-        self.hit_count = data.get('hit_count', 0)
-        self.miss_count = data.get('miss_count', 0)
-        self.threshold = data.get('threshold', self.threshold)
-        self.max_size = data.get('max_size', self.max_size)
-        print(f"📂 Cache loaded from {filepath} with {len(self.cache)} entries")
-
-
-# ============================================
-# SWIFT FORWARD WITH ADAPTIVE CACHE
-# ============================================
-
-def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, optimizer=None, utility=None,
-                  logits_processor=None, max_steps=512, cache_enabled=True, cache_threshold=0.85, 
-                  cache_max_size=100, cache_file=None):
-    """
-    SWIFT forward với Adaptive Cache.
-    
-    Args:
-        cache_enabled: Bật/tắt Adaptive Cache
-        cache_threshold: Ngưỡng cosine similarity cho cache HIT
-        cache_max_size: Kích thước tối đa của cache
-        cache_file: Đường dẫn file để load/save cache
-    """
+def _swift_forward_impl(input_ids, model, tokenizer, max_new_tokens, statistics=None, optimizer=None, utility=None,
+                  logits_processor=None, max_steps=512):
     assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
+    # Avoid modifying the input_ids in-place
     input_ids = input_ids.clone()
     accept_length_list = []
-    
-    # ============================================
-    # 1. KHỞI TẠO ADAPTIVE CACHE
-    # ============================================
-    if not hasattr(swift_forward, "cache"):
-        swift_forward.cache = AdaptiveCache(
-            max_size=cache_max_size,
-            similarity_threshold=cache_threshold
-        )
-        print("🔧 AdaptiveCache initialized!")
-        
-        # Load cache từ file nếu có
-        if cache_file:
-            try:
-                swift_forward.cache.load_from_file(cache_file)
-            except FileNotFoundError:
-                print(f"⚠️ Cache file {cache_file} not found, starting fresh")
-    
-    # ============================================
-    # 2. TRUY XUẤT CACHE
-    # ============================================
-    use_cache_layer = False
-    cached_attn = None
-    cached_mlp = None
-    embedding = None
-    
-    if cache_enabled:
-        embedding = swift_forward.cache.get_embedding(input_ids, model)
-        cached_attn, cached_mlp, similarity = swift_forward.cache.find_similar(embedding)
-        
-        if cached_attn is not None:
-            print(f"✅ Cache HIT! Similarity: {similarity:.3f}")
-            model.set_skip_layers(cached_attn, cached_mlp)
-            use_cache_layer = True
-        else:
-            print(f"🔍 Cache MISS! Best similarity: {similarity:.3f}")
-            # Fallback: uniform skip (giống SWIFT gốc)
-            _attn_skip_layer_id_set = np.arange(1, model.config.num_hidden_layers - 1, 2)
-            _mlp_skip_layer_id_set = np.arange(1, model.config.num_hidden_layers - 1, 2)
-            model.set_skip_layers(_attn_skip_layer_id_set, _mlp_skip_layer_id_set)
-            use_cache_layer = False
-    else:
-        # Nếu cache bị tắt, dùng uniform skip như SWIFT gốc
-        _attn_skip_layer_id_set = np.arange(1, model.config.num_hidden_layers - 1, 2)
-        _mlp_skip_layer_id_set = np.arange(1, model.config.num_hidden_layers - 1, 2)
-        model.set_skip_layers(_attn_skip_layer_id_set, _mlp_skip_layer_id_set)
 
-    # ============================================
-    # 3. PHẦN CÒN LẠI CỦA SWIFT (GIỮ NGUYÊN)
-    # ============================================
     # Initialize the past key and value states
     (
         past_key_values,
@@ -312,7 +52,6 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
     new_token_num = 0
     draft_token_num = 0
     total_acc_num = 0
-    
     for idx in range(max_steps):
         # drafted tokens + 1 bonus verified token
         draft_token_num += len(top1_prob)
@@ -358,11 +97,9 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
             sample_p
         )
 
-        # ============================================
-        # 4. LAYER SET OPTIMIZATION - CHỈ CHẠY KHI CACHE MISS
-        # ============================================
-        if (not use_cache_layer) and (new_token_num > (statistics["context_window"] + 1) 
-                and statistics["optimization"] and idx % statistics["opt_interval"] == 0):
+        # layer set optimization
+        if (new_token_num > (statistics["context_window"] + 1) and statistics["optimization"]
+                and idx % statistics["opt_interval"] == 0):
             swift_optimization(
                 model,
                 input_ids[:, input_len:],
@@ -391,39 +128,63 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
             break
         if new_token_num > max_new_tokens:
             break
-    
     logging.info("token acceptance rate: {}".format(total_acc_num / draft_token_num))
-
-    # ============================================
-    # 5. LƯU LAYER SET VÀO CACHE
-    # ============================================
-    if (not use_cache_layer) and cache_enabled and embedding is not None:
-        best_attn_skip, best_mlp_skip = model.get_skip_layers()
-        # Chỉ lưu nếu layer set khác với default
-        default_attn = np.arange(1, model.config.num_hidden_layers - 1, 2).tolist()
-        default_mlp = np.arange(1, model.config.num_hidden_layers - 1, 2).tolist()
-        
-        if (not np.array_equal(best_attn_skip, default_attn)) or (not np.array_equal(best_mlp_skip, default_mlp)):
-            swift_forward.cache.add_to_cache(embedding, best_attn_skip, best_mlp_skip)
-            print(f"💾 Cached new layer set! {swift_forward.cache.get_stats()}")
-    
-    # In thống kê cache
-    if cache_enabled:
-        print(f"📊 {swift_forward.cache.get_stats()}")
-    
-    # Lưu cache xuống file nếu được yêu cầu
-    if cache_file and cache_enabled:
-        try:
-            swift_forward.cache.save_to_file(cache_file)
-        except Exception as e:
-            print(f"⚠️ Failed to save cache: {e}")
-    
     return input_ids, new_token_num, idx + 1, accept_length_list, draft_token_num
 
 
-# ============================================
-# MAIN
-# ============================================
+def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, optimizer=None, utility=None,
+                  logits_processor=None, max_steps=512, cache_enabled=False, cache_threshold=0.85,
+                  cache_max_size=100, cache_file=None):
+    """Cache overlays SWIFT's stream incumbent; misses retain its optimizer state."""
+    common = dict(statistics=statistics, optimizer=optimizer, utility=utility,
+                  logits_processor=logits_processor, max_steps=max_steps)
+    if not cache_enabled:
+        result = _swift_forward_impl(input_ids, model, tokenizer, max_new_tokens, **common)
+        swift_forward.last_metrics = dict(getattr(_swift_forward_impl, 'last_metrics', {}), cache_enabled=False)
+        return result
+    if not hasattr(swift_forward, 'cache'):
+        swift_forward.cache = AdaptiveCache(cache_max_size, cache_threshold)
+    cache = swift_forward.cache
+    incumbent = tuple(list(map(int, x)) for x in model.get_skip_layers())
+    before_iter, before_score = statistics['opt_iter'], statistics['origin_score']
+    embedding_before, search_before = cache.total_embedding_time, cache.total_search_time
+    embedding = cache.get_embedding(input_ids, model)
+    attn, mlp, similarity = cache.find_similar(embedding)
+    hit = attn is not None
+    matched_entry = cache.last_entry
+    used_layers = [attn, mlp] if hit else None
+    optimization_was_active = statistics['optimization']
+    if hit:
+        model.set_skip_layers(attn, mlp)
+        statistics['optimization'] = False
+    try:
+        result = _swift_forward_impl(input_ids, model, tokenizer, max_new_tokens, **common)
+        if not hit:
+            used_layers = [list(map(int, x)) for x in model.get_skip_layers()]
+        update_start = time.perf_counter()
+        source = dict(getattr(swift_forward, 'request_context', {}))
+        source.update({'opt_steps_on_source': statistics['opt_iter'] - before_iter,
+                       'incumbent_improved_on_source': statistics['origin_score'] > before_score,
+                       'origin_score': statistics['origin_score'], 'source_kind': 'stream_incumbent'})
+        if not hit:
+            cache.add_to_cache(embedding, *used_layers, metadata=source)
+        if cache_file:
+            cache.save_to_file(cache_file, swift_forward.cache_identity)
+        update_seconds = time.perf_counter() - update_start
+        swift_forward.last_metrics = dict(getattr(_swift_forward_impl, 'last_metrics', {}),
+            cache_enabled=True, cache_hit=hit, cache_similarity=similarity,
+            cache_entry_source=matched_entry if hit else source, used_layers=used_layers,
+            embedding_seconds=cache.total_embedding_time-embedding_before,
+            search_seconds=cache.total_search_time-search_before,
+            cache_update_seconds=update_seconds, cache_size=len(cache.cache))
+        return result
+    finally:
+        if hit:
+            model.set_skip_layers(*incumbent)
+            statistics['optimization'] = optimization_was_active
+        reset_swift_mode(model)
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -581,6 +342,12 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+    if args.cache_enabled and args.cache_hit:
+        parser.error('Adaptive retrieval and static --cache-hit cannot be combined')
+    if args.cache_max_size < 1 or not -1 <= args.cache_threshold <= 1:
+        parser.error('Invalid cache size or cosine threshold')
+    if not args.cache_enabled and (args.cache_file or args.cache_clear):
+        parser.error('--cache-file / --cache-clear require --cache-enabled')
 
     args.model_name = (args.model_id + "-swift-" + str(args.dtype)+ "-temp-" + str(args.temperature)
                        + "-top-p-" + str(args.top_p) + "-seed-" + str(args.seed) + "-max_new_tokens-" + str(args.max_new_tokens)+ "-opt_interval-" + str(args.opt_interval)
@@ -634,10 +401,18 @@ if __name__ == "__main__":
                   "max_tolerance_iter": args.max_tolerance_iter, "max_score": args.max_score,
                   "context_window": args.context_window, "optimization": args.optimization, "bayes": args.bayes}
 
-    # Clear cache nếu được yêu cầu
-    if args.cache_clear and hasattr(swift_forward, "cache"):
-        swift_forward.cache.clear()
-        print("🧹 Cache cleared!")
+    # The cache belongs to this run, and is initialized before any request.
+    swift_forward.cache_identity = {
+        'model_path': args.model_path, 'model_revision': getattr(model.config, '_commit_hash', None),
+        'model_config': model.config.to_dict(), 'dtype': args.dtype,
+        'protocol': 'stream-incumbent-v1', 'context_window': args.context_window,
+        'skip_ratio': args.skip_ratio, 'task_name': args.task_name,
+    }
+    if args.cache_enabled:
+        swift_forward.cache = AdaptiveCache(args.cache_max_size, args.cache_threshold)
+        # --cache-clear intentionally bypasses loading an existing persistent cache.
+        if args.cache_file and Path(args.cache_file).exists() and not args.cache_clear:
+            swift_forward.cache.load_from_file(args.cache_file, swift_forward.cache_identity)
 
     run_eval(
         model=model,
