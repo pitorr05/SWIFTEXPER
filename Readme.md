@@ -47,6 +47,12 @@ git pull --ff-only origin main
 git fetch origin AdaptiveCache:refs/remotes/origin/AdaptiveCache
 source .venv/bin/activate
 CUDA_VISIBLE_DEVICES=0 bash scripts/run_h100.sh
+
+
+note :
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_h100.sh \
+  --llama-model meta-llama/Llama-2-7b-hf \
+  --code-model codellama/CodeLlama-7b-hf
 ```
 
 The launcher uses the current Python interpreter, performs the full experiments directly, and automatically evaluates HumanEval. It does not run a preliminary smoke experiment or warm-up, install packages, or modify the original algorithm files in the working repository.
