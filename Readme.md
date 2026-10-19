@@ -70,6 +70,27 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/run_h100.sh --seeds 2024 2025 2026
 
 To override Hugging Face model IDs, interpreter, or Git refs, use `LLAMA_MODEL_PATH`, `CODE_MODEL_PATH`, `PYTHON_BIN`, `SWIFT_REF`, or `ADAPTIVE_REF`. Despite their names, the model variables accept either Hugging Face IDs or local paths. `--help` lists the remaining options.
 
+### GSM8K: speed and answer accuracy
+
+Run only GSM8K, without repeating CNN/DM or HumanEval:
+
+```bash
+# LLaMA-2-13B; both profiles, three methods per profile, sequentially.
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_h100.sh --tasks gsm8k
+
+# LLaMA-2-7B; no CodeLLaMA is loaded for GSM8K.
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_h100.sh --tasks gsm8k \
+  --llama-model meta-llama/Llama-2-7b-hf
+```
+
+By default this runs `paper64` (64 new tokens) followed by `quality512` (512 new tokens).
+Select one with `--gsm8k-profiles paper64` or `--gsm8k-profiles quality512`.
+Use `--tasks cnndm humaneval gsm8k` to run all datasets. Without `--tasks`, the original two-dataset default stays unchanged.
+
+Both GSM8K profiles use the same seeded 1,000 test questions and five train demonstrations from `openai/gsm8k`, configuration `main`. Prompts request a final `#### number`. This is our explicit prompt/scoring protocol, not a claim of identical author prompts. Too-long GSM8K prompts fail instead of dropping demonstrations or question text. Target model IDs in JSONL now derive from the selected model path, including 7B overrides.
+
+`results.csv` distinguishes `gsm8k.paper64` and `gsm8k.quality512`. It includes accuracy, accuracy delta, missing-answer rate, token-limit rate, and paired correct-to-wrong/wrong-to-correct counts relative to baseline. The corresponding `gsm8k.<profile>.<method>.accuracy.json` contains per-question predictions and IDs of changed correctness. Missing answers count as incorrect. Scoring uses the first `####` numeric answer before any subsequent `Question:`; commas, signs and decimal formatting are normalized, with no fallback to numbers in intermediate reasoning. Token-limit rate counts outputs whose length equals the budget (even if EOS is the last token); it does not prove an answer was truncated. Inspect it together with missing-answer rate. `quality512` is the main quality profile, but 512 tokens do not guarantee every solution finishes. The 64-token profile matches the paper's generation budget, not necessarily its exact full protocol or hardware results.
+
 ## Results and reproducibility
 
 Each run creates `_local/runs/h100_<UTC timestamp>/`. Read `results.csv` for decoding speed, speedups, acceptance metrics, token mismatches, and HumanEval pass@1. Per-task code correctness is in `seed_2024/humaneval.<method>.samples.jsonl_results.jsonl`; aggregate scores are in `humaneval.<method>.pass1.json`. Commands, downloads, inference progress, optimization and evaluator output stream directly to the terminal with unbuffered Python output. The launcher creates no text log files and does not append operational messages to `EXPERIMENT_LOG.md`.

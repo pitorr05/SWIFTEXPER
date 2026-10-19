@@ -1,4 +1,4 @@
-"""One-shot H100 experiments: CNN/DM, HumanEval, and automatic pass@1."""
+"""Sequential H100 experiments: CNN/DM, HumanEval pass@1, and optional GSM8K accuracy."""
 import argparse
 import csv
 from datetime import datetime, timezone
@@ -20,6 +20,7 @@ REPO = SCRIPTS.parent
 sys.path.insert(0, str(SCRIPTS / 'assets'))
 from research_utils import METRIC_PROTOCOL, aggregate, compare_aggregates, read_records, validate_pair, write_json
 from source_patches import prepare
+from gsm8k import score_records, compare_scores
 
 def note(message):
     """Display progress immediately; never write runtime messages to files."""
@@ -145,7 +146,9 @@ FIELDS = ['metric_protocol', 'seed', 'dataset', 'model', 'method', 'samples', 't
           'global_tokens_per_second', 'global_throughput_speedup_vs_baseline', 'global_throughput_speedup_vs_swift',
           'inference_time_speedup_vs_baseline', 'inference_time_speedup_vs_swift', 'mean_accepted_length',
           'acceptance_rate', 'cache_hit_rate', 'embedding_seconds', 'search_seconds',
-          'token_mismatch_vs_baseline', 'pass_at_1', 'passed', 'evaluated', 'pass_at_1_delta_vs_baseline']
+          'token_mismatch_vs_baseline', 'pass_at_1', 'passed', 'evaluated', 'pass_at_1_delta_vs_baseline',
+          'accuracy', 'accuracy_delta_vs_baseline', 'correct', 'missing_answer_rate', 'token_limit_rate',
+          'correct_to_wrong_vs_baseline', 'wrong_to_correct_vs_baseline']
 
 
 def write_results(output, rows):
@@ -178,11 +181,34 @@ def build_result_rows(seed, task, model, summaries, comparisons, scores):
                    comparisons[f'{method}_vs_baseline']['token_mismatch_count'])
         if method == 'baseline':
             row['acceptance_rate'] = None
-        if scores:
+        if scores and task.startswith('gsm8k.'):
+            score = scores[method]
+            paired = compare_scores(score, scores['baseline'])
+            row.update(accuracy=score['accuracy'], correct=score['correct'], evaluated=score['total'],
+                       accuracy_delta_vs_baseline=score['accuracy']-scores['baseline']['accuracy'],
+                       missing_answer_rate=score['missing_answer_rate'], token_limit_rate=score['token_limit_rate'],
+                       correct_to_wrong_vs_baseline=len(paired['correct_to_wrong_ids']),
+                       wrong_to_correct_vs_baseline=len(paired['wrong_to_correct_ids']))
+        elif scores:
             row.update(pass_at_1=scores[method]['pass@1'], passed=scores[method]['passed'], evaluated=164,
                        pass_at_1_delta_vs_baseline=scores[method]['pass@1']-scores['baseline']['pass@1'])
         rows.append(row)
     return rows
+
+
+def task_configs(args):
+    """Artifact key, actual task, model, model ID, count, budget, top-p, revision."""
+    llama_id = Path(args.llama_model.rstrip('/\\')).name
+    code_id = Path(args.code_model.rstrip('/\\')).name
+    for task in args.tasks:
+        if task == 'cnndm':
+            yield task, task, args.llama_model, llama_id, 1000, 64, 0.85, args.llama_revision
+        elif task == 'humaneval':
+            yield task, task, args.code_model, code_id, 164, 512, 0.95, args.code_revision
+        else:
+            for profile in args.gsm8k_profiles:
+                limit = {'paper64': 64, 'quality512': 512}[profile]
+                yield f'gsm8k.{profile}', task, args.llama_model, llama_id, 1000, limit, 0.85, args.llama_revision
 
 
 def execute(args, output, reference, adaptive):
@@ -193,16 +219,13 @@ def execute(args, output, reference, adaptive):
         folder.mkdir()
         methods = ['baseline', 'swift', 'adaptive']
         order = methods[repetition % 3:] + methods[:repetition % 3]
-        for task, model, model_id, count, limit, top_p, revision in (
-            ('cnndm', args.llama_model, 'llama-2-13b', 1000, 64, 0.85, args.llama_revision),
-            ('humaneval', args.code_model, 'codellama-13b', 164, 512, 0.95, args.code_revision),
-        ):
+        for task, inference_task, model, model_id, count, limit, top_p, revision in task_configs(args):
             note(f'Run {output.name}, seed {seed}: starting {task}, {count} tasks; order: {", ".join(order)}.')
             for method in order:
                 root = adaptive if method == 'adaptive' else reference
                 module = 'inference_baseline' if method == 'baseline' else 'inference_swift'
                 command = [sys.executable, '-m', f'evaluation_llama.{module}', '--model-path', model,
-                           '--model-id', model_id, '--task-name', task, '--data-num', str(count),
+                           '--model-id', model_id, '--task-name', inference_task, '--data-num', str(count),
                            '--max-new-tokens', str(limit), '--temperature', '0.0', '--top-p', str(top_p),
                            '--dtype', 'float16', '--seed', str(seed), '--data-seed', str(args.data_seed),
                            '--answer-file', str(folder / f'{task}.{method}.jsonl')]
@@ -230,6 +253,15 @@ def execute(args, output, reference, adaptive):
                     scores[method] = json.loads(score_path.read_text(encoding='utf-8'))
                     note(f'HumanEval {method}, seed {seed}: pass@1 = {scores[method]["pass@1"]:.6f}, '
                          f'{scores[method]["passed"]}/164 passed. Results: {score_path}')
+            elif inference_task == 'gsm8k':
+                for method in methods:
+                    scores[method] = score_records(read_records(folder / f'{task}.{method}.jsonl'), count)
+                for method in methods:
+                    score = scores[method]
+                    score['vs_baseline'] = compare_scores(score, scores['baseline'])
+                    write_json(folder / f'{task}.{method}.accuracy.json', score)
+                    note(f'{task}/{method}: accuracy={score["accuracy"]:.4f}, '
+                         f'missing={score["missing_answer_rate"]:.4f}, token_limit={score["token_limit_rate"]:.4f}')
             rows.extend(build_result_rows(seed, task, model, summaries, comparisons, scores))
             write_results(output, rows)
             note(f'Results saved for {task}, seed {seed}: {output / "results.csv"}. '
@@ -251,10 +283,16 @@ def main():
     parser.add_argument('--code-revision', default=os.environ.get('CODE_REVISION'))
     parser.add_argument('--seeds', type=int, nargs='+', default=[int(x) for x in os.environ.get('SEEDS', '2024').replace(',', ' ').split()])
     parser.add_argument('--data-seed', type=int, default=2024)
+    parser.add_argument('--tasks', nargs='+', choices=['cnndm', 'humaneval', 'gsm8k'],
+                        default=['cnndm', 'humaneval'])
+    parser.add_argument('--gsm8k-profiles', nargs='+', choices=['paper64', 'quality512'],
+                        default=['paper64', 'quality512'])
     parser.add_argument('--eval-workers', type=int, default=4)
     parser.add_argument('--eval-timeout', type=float, default=3.0)
     parser.add_argument('--prepare-only', action='store_true', help='Export sources and patches only; no GPU inference or scoring')
     args = parser.parse_args()
+    if len(set(args.tasks)) != len(args.tasks) or len(set(args.gsm8k_profiles)) != len(args.gsm8k_profiles):
+        parser.error('Duplicate tasks or GSM8K profiles are not supported')
     import math
     if not args.seeds or len(set(args.seeds)) != len(args.seeds) or args.eval_workers < 1 or not math.isfinite(args.eval_timeout) or args.eval_timeout <= 0:
         parser.error('Distinct seeds, positive eval-workers and eval-timeout required')
@@ -290,12 +328,14 @@ def main():
             write_json(output / 'status.json', {'status': 'prepared_only', 'inference_ran': False, 'pass1_evaluated': False})
             note(f'Sources prepared only: {output}. No GPU inference or evaluation was run.')
             return
-        stage = 'inference / HumanEval evaluation'
+        stage = 'inference / evaluation'
         rows = execute(args, output, reference, adaptive)
-        write_json(output / 'status.json', {'status': 'complete', 'rows': len(rows), 'pass1_evaluated': True})
+        write_json(output / 'status.json', {'status': 'complete', 'rows': len(rows),
+                   'pass1_evaluated': 'humaneval' in args.tasks, 'gsm8k_evaluated': 'gsm8k' in args.tasks})
         table = '\n'.join(f'- seed {r["seed"]}, {r["dataset"]}/{r["method"]}: {r["tokens_per_second"]:.3f} tokens/s, '
                           f'speedup vs baseline {r["speedup_vs_baseline"]:.3f}x'
-                          + (f', pass@1 {r["pass_at_1"]:.6f} ({r["passed"]}/164)' if 'pass_at_1' in r else '') for r in rows)
+                          + (f', pass@1 {r["pass_at_1"]:.6f} ({r["passed"]}/164)' if 'pass_at_1' in r else '')
+                          + (f', accuracy {r["accuracy"]:.4f}, token_limit {r["token_limit_rate"]:.4f}' if 'accuracy' in r else '') for r in rows)
         note(f'Run complete: {output / "results.csv"}\n\n{table}\n\n'
              'Matching pass@1 alone does not establish preservation of the full output distribution.')
         print(f'\nDONE: {output / "results.csv"}', flush=True)

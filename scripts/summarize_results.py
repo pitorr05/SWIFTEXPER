@@ -1,11 +1,13 @@
-"""Recompute SWIFT-author speed metrics from an existing run; no inference or code execution."""
+"""Recompute speed metrics and optional GSM8K numeric accuracy; no inference or code execution."""
 import argparse
 import csv
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
-from run_experiments import FIELDS, METRIC_PROTOCOL, build_result_rows, compare_task, note, write_json
+from run_experiments import (FIELDS, METRIC_PROTOCOL, build_result_rows, compare_task, note, write_json,
+                             task_configs, read_records, score_records)
 
 
 def summarize(run_dir, output_dir=None):
@@ -19,10 +21,13 @@ def summarize(run_dir, output_dir=None):
     if config.get('prepare_only'):
         raise ValueError('This run only prepared sources; there are no inference results to summarize')
     rows, datasets = [], []
+    task_args = SimpleNamespace(**{**config, 'tasks': config.get('tasks', ['cnndm', 'humaneval']),
+                                  'gsm8k_profiles': config.get('gsm8k_profiles', ['paper64', 'quality512']),
+                                  'llama_revision': config.get('llama_revision'),
+                                  'code_revision': config.get('code_revision')})
     for seed in config['seeds']:
         folder = run_dir / f'seed_{seed}'
-        for task, count, model in (('cnndm', 1000, config['llama_model']),
-                                   ('humaneval', 164, config['code_model'])):
+        for task, inference_task, model, _, count, _, _, _ in task_configs(task_args):
             summaries, comparisons = compare_task(folder, task, count, write_comparison=False)
             scores = {}
             if task == 'humaneval':
@@ -36,8 +41,13 @@ def summarize(run_dir, output_dir=None):
                             or not math.isclose(value, passed/164, abs_tol=1e-12)):
                         raise ValueError(f'Invalid existing pass@1 result: {score_path}')
                     scores[method] = score
+            elif inference_task == 'gsm8k':
+                # Pure numeric scoring from immutable outputs; no model or code execution.
+                for method in ('baseline', 'swift', 'adaptive'):
+                    scores[method] = score_records(read_records(folder / f'{task}.{method}.jsonl'), count)
             rows.extend(build_result_rows(seed, task, model, summaries, comparisons, scores))
-            datasets.append({'seed': seed, 'dataset': task, 'summaries': summaries, 'comparisons': comparisons})
+            datasets.append({'seed': seed, 'dataset': task, 'summaries': summaries, 'comparisons': comparisons,
+                             'gsm8k_scores': scores if inference_task == 'gsm8k' else None})
     if not rows:
         raise ValueError('Run configuration has no seeds to summarize')
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -58,7 +68,8 @@ def main():
     args = parser.parse_args()
     csv_path, json_path = summarize(args.run_dir, args.output_dir)
     note(f'Speed metrics recomputed from {args.run_dir.resolve()} using {METRIC_PROTOCOL}: '
-         f'{csv_path}, {json_path}. No inference or evaluation was run; existing artifacts are unchanged.')
+         f'{csv_path}, {json_path}. No GPU inference or generated-code execution was run; '
+         'GSM8K numeric scores are recomputed when selected. Existing artifacts are unchanged.')
 
 
 if __name__ == '__main__':

@@ -11,6 +11,7 @@ import torch
 from tqdm import tqdm
 from evaluation_llama.research_utils import METRIC_PROTOCOL, aggregate, digest, validate_output_path, write_json
 from evaluation_llama.phase_timer import finish_request
+from evaluation_llama.gsm8k import PROTOCOL as GSM8K_PROTOCOL, load_gsm8k
 
 
 def seed_everything(seed=2024):
@@ -36,6 +37,9 @@ def clip_input(tokenizer, prompt, task_name, max_new_tokens=512, tree_length=250
         tail_text = '\nSummary:'
     elif task_name == 'humaneval':
         text, tail_text = prompt['prompt'], ''
+    elif task_name == 'gsm8k':
+        text = prompt_shots + 'Question: ' + prompt['question'] + '\nAnswer:'
+        tail_text = ''
     else:
         raise ValueError(f'Unsupported task: {task_name}')
     ids = tokenizer(text, return_tensors='pt').input_ids.to(device)
@@ -43,8 +47,8 @@ def clip_input(tokenizer, prompt, task_name, max_new_tokens=512, tree_length=250
     if available < 1:
         raise ValueError('Context window too small for generation and tree reserve')
     if ids.shape[1] > available:
-        if task_name == 'humaneval':
-            raise ValueError('Refusing to truncate a HumanEval prompt')
+        if task_name in ('humaneval', 'gsm8k'):
+            raise ValueError(f'Refusing to truncate a {task_name} prompt; few-shot context must fit')
         tail = len(tokenizer(tail_text, add_special_tokens=False).input_ids)
         if available <= tail:
             raise ValueError('Insufficient room for CNN/DM prompt')
@@ -55,6 +59,10 @@ def clip_input(tokenizer, prompt, task_name, max_new_tokens=512, tree_length=250
 def load_data(task_name, seed, data_num=10):
     if data_num <= 0:
         raise ValueError('data-num must be positive')
+    if task_name == 'gsm8k':
+        data, shots, metadata = load_gsm8k(seed, data_num)
+        load_data.last_metadata = metadata
+        return data, shots
     if task_name == 'cnndm':
         from datasets import load_dataset
         dataset = load_dataset('cnn_dailymail', name='3.0.0', split='test')
@@ -114,7 +122,8 @@ def run_eval(model, tokenizer, forward_func, model_id, answer_file, max_new_toke
         seed_everything(seed)
         data, shots = load_data(task_name, data_seed, data_num)
         manifest = {'task_name': task_name, 'data_seed': data_seed,
-                    'dataset': 'cnn_dailymail/3.0.0/test' if task_name == 'cnndm' else 'human_eval/read_problems',
+                    'dataset': {'cnndm': 'cnn_dailymail/3.0.0/test', 'humaneval': 'human_eval/read_problems',
+                                'gsm8k': 'openai/gsm8k/main/test'}[task_name],
                     'one_shot_prompt': shots, 'one_shot_sha256': digest(shots),
                     'task_ids': [q['task_id'] if task_name == 'humaneval' else q['id'] for q in data],
                     'dataset_metadata': getattr(load_data, 'last_metadata', {})}
@@ -158,6 +167,10 @@ def run_eval(model, tokenizer, forward_func, model_id, answer_file, max_new_toke
             row = {'schema_version': 1, 'task_name': task_name, 'task_id': task_id, 'model_id': model_id,
                    'input_token_ids': inputs, 'input_sha256': digest(inputs), 'output_token_ids': tokens,
                    'choices': [choice], 'forward_metrics': metrics, 'tstamp': time.time()}
+            if task_name == 'gsm8k':
+                row.update(reference_answer=question['answer'], gsm8k_protocol=GSM8K_PROTOCOL,
+                           hit_token_limit=len(tokens) == max_new_tokens,
+                           termination_reason='eos' if tokens and tokens[-1] == eos else 'token_limit')
             stream.write(json.dumps(row, ensure_ascii=False) + '\n')
             stream.flush()
             records.append(row)
