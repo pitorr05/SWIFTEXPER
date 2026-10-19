@@ -195,3 +195,20 @@ Run `C:\Users\Admin\SWIFTEXPER\_local\runs\branch_owned_source_review_20261020` 
 Người dùng đã yêu cầu thực thi commit/push cả hai nhánh. Đã kiểm tra remote: `main` đang ở `a0b0256`, `AdaptiveCache` ở `bed8683`, phù hợp ancestry của các thay đổi local; không cần force push. Source `.py` SWIFT gốc và các cấu hình upstream không đổi. Bộ chạy gồm 7 file Python có syntax Python 3.9 hợp lệ, shell launcher có Bash syntax hợp lệ. `_local/` không được stage; chỉ đưa tài liệu, ignore rules, scripts và việc bỏ 6 bytecode đã tracked lên main. Contribution đã nằm trong commit `fec8d32` trên AdaptiveCache.
 
 Git trong sandbox không đọc được credentials Windows; kiểm tra remote đã thực hiện ngoài sandbox với quyền được cấp. Không thay đổi credential, remote URL hoặc lịch sử Git. Kết quả commit/push và xác minh remote sẽ được ghi nối tiếp sau khi lệnh hoàn thành. Chưa chạy thực nghiệm H100 ở bước công bố source này.
+
+### Đã push thành công
+
+Đã tạo commit main `bb07794` — Add organized H100 experiments with automatic HumanEval pass@1 — và push atomic cùng contribution `fec8d32` lên `https://github.com/pitorr05/SWIFTEXPER`. GitHub đã nhận cả hai nhánh; `git ls-remote --heads origin main AdaptiveCache` xác nhận đúng hai commit sau push. Không có force push; `_local/` và dữ liệu local không nằm trong commit. Mục xác nhận này được lưu bằng commit tài liệu tiếp theo trên main.
+
+Lệnh trên server để lấy cả hai nhánh và chạy (model tự tải qua Hugging Face ID):
+
+```bash
+cd /data/SWIFTEXPER
+git switch main
+git pull --ff-only origin main
+git fetch origin AdaptiveCache:refs/remotes/origin/AdaptiveCache
+source .venv/bin/activate
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_h100.sh
+```
+
+Chỉ hoàn thành công bố source; chưa chạy job trên server H100 hoặc báo điểm pass@1. Output thực tế sẽ nằm trong `_local/runs/` và được ghi tiếp vào nhật ký khi script chạy trên server.
