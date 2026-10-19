@@ -1,6 +1,5 @@
 """One-shot H100 experiments: CNN/DM, HumanEval, and automatic pass@1."""
 import argparse
-from collections import deque
 import csv
 from datetime import datetime, timezone
 import difflib
@@ -22,16 +21,8 @@ sys.path.insert(0, str(SCRIPTS / 'assets'))
 from research_utils import METRIC_PROTOCOL, aggregate, compare_aggregates, read_records, validate_pair, write_json
 from source_patches import prepare
 
-EXECUTION_LOG = None
-
-
-def note(message, log_path=None):
-    """Operational progress belongs to run artifacts, not the research design document."""
-    stamp = datetime.now(timezone.utc).isoformat(timespec='seconds')
-    target = Path(log_path) if log_path is not None else EXECUTION_LOG
-    if target is not None:
-        with open(target, 'a', encoding='utf-8') as stream:
-            stream.write(f'[{stamp}] {message}\n')
+def note(message):
+    """Display progress immediately; never write runtime messages to files."""
     print(message, flush=True)
 
 
@@ -77,24 +68,17 @@ def save_changes(folder, original):
         compile(content, str(folder / path), 'exec')
 
 
-def run(command, cwd, logfile):
-    note(f'RUN {shlex.join(map(str, command))}\nLOG {logfile}')
+def run(command, cwd):
+    note(f'RUN {shlex.join(map(str, command))}')
+    environment = os.environ.copy()
+    environment['PYTHONUNBUFFERED'] = '1'
+    environment.setdefault('PYTHONIOENCODING', 'utf-8')
     try:
-        with open(logfile, 'x', encoding='utf-8') as stream:
-            subprocess.run(list(map(str, command)), cwd=cwd, stdout=stream,
-                           stderr=subprocess.STDOUT, check=True)
+        # Inherit stdout/stderr so downloads, tqdm, optimization and tracebacks stay live.
+        subprocess.run(list(map(str, command)), cwd=cwd, env=environment, check=True)
     except subprocess.CalledProcessError as error:
-        # Close the writer first, then surface the actual child traceback, not just exit status.
-        try:
-            with open(logfile, encoding='utf-8', errors='replace') as stream:
-                tail = ''.join(deque(stream, maxlen=80))[-20000:].rstrip()
-        except OSError as read_error:
-            tail = f'Could not read subprocess log: {read_error}'
-        if not tail:
-            tail = '(Subprocess produced no output.)'
-        raise RuntimeError(f'Command failed (exit {error.returncode}); full log: {logfile}\n'
-                           f'--- last subprocess log lines ---\n{tail}\n'
-                           '--- end subprocess log ---') from error
+        raise RuntimeError(f'Command failed (exit {error.returncode}): {shlex.join(map(str, command))}. '
+                           'The original subprocess error is printed directly above.') from error
 
 
 def check_environment(output):
@@ -116,7 +100,7 @@ def check_environment(output):
     if packages['transformers'] != '4.37.1':
         note('NOTE: original SWIFT pins transformers==4.37.1; active version is '
              + packages['transformers'] + '. No packages were changed.')
-    run(['nvidia-smi'], REPO, output / 'nvidia-smi.log')
+    run(['nvidia-smi'], REPO)
 
 
 def compare_task(folder, task, expected, write_comparison=True):
@@ -213,7 +197,7 @@ def execute(args, output, reference, adaptive):
             ('cnndm', args.llama_model, 'llama-2-13b', 1000, 64, 0.85, args.llama_revision),
             ('humaneval', args.code_model, 'codellama-13b', 164, 512, 0.95, args.code_revision),
         ):
-            note(f'Run `{output.name}`, seed {seed}: bắt đầu {task}, {count} bài, thứ tự {", ".join(order)}.')
+            note(f'Run {output.name}, seed {seed}: starting {task}, {count} tasks; order: {", ".join(order)}.')
             for method in order:
                 root = adaptive if method == 'adaptive' else reference
                 module = 'inference_baseline' if method == 'baseline' else 'inference_swift'
@@ -230,9 +214,9 @@ def execute(args, output, reference, adaptive):
                                 '--max-score', '0.95', '--optimization', '--bayes']
                 if method == 'adaptive':
                     command += ['--cache-enabled', '--cache-clear', '--cache-threshold', '0.85', '--cache-max-size', '100']
-                run(command, root, folder / f'{task}.{method}.log')
-                note(f'Đã sinh xong `{task}/{method}`, seed {seed}; output `{folder / (task+"."+method+".jsonl")}`. '
-                     + ('Chưa chấm pass@1 ở bước này.' if task == 'humaneval' else ''))
+                run(command, root)
+                note(f'Inference complete: {task}/{method}, seed {seed}; output: {folder / (task+"."+method+".jsonl")}. '
+                     + ('HumanEval pass@1 has not been evaluated yet.' if task == 'humaneval' else ''))
             summaries, comparisons = compare_task(folder, task, count)
             scores = {}
             if task == 'humaneval':
@@ -242,19 +226,18 @@ def execute(args, output, reference, adaptive):
                          '--input', str(folder / f'humaneval.{method}.jsonl'),
                          '--samples', str(folder / f'humaneval.{method}.samples.jsonl'),
                          '--score', str(score_path), '--workers', str(args.eval_workers),
-                         '--timeout', str(args.eval_timeout)], reference, folder / f'humaneval.{method}.pass1.log')
+                         '--timeout', str(args.eval_timeout)], reference)
                     scores[method] = json.loads(score_path.read_text(encoding='utf-8'))
-                    note(f'HumanEval `{method}`, seed {seed}: pass@1 = {scores[method]["pass@1"]:.6f}, '
-                         f'{scores[method]["passed"]}/164 bài đạt. Chi tiết `{score_path}`.')
+                    note(f'HumanEval {method}, seed {seed}: pass@1 = {scores[method]["pass@1"]:.6f}, '
+                         f'{scores[method]["passed"]}/164 passed. Results: {score_path}')
             rows.extend(build_result_rows(seed, task, model, summaries, comparisons, scores))
             write_results(output, rows)
-            note(f'Đã tổng hợp {task}, seed {seed}, vào `{output / "results.csv"}`. '
-                 'Token mismatch được báo cáo, không tự coi là lỗi evaluator hoặc bảo toàn chất lượng.')
+            note(f'Results saved for {task}, seed {seed}: {output / "results.csv"}. '
+                 'Token mismatches are reported separately from functional correctness.')
     return rows
 
 
 def main():
-    global EXECUTION_LOG
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
         sys.stderr.reconfigure(encoding='utf-8', errors='replace')
@@ -280,10 +263,9 @@ def main():
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
     output = (args.output_dir or REPO / '_local' / 'runs' / f'h100_{stamp}').resolve()
     output.mkdir(parents=True, exist_ok=False)
-    EXECUTION_LOG = output / 'execution.log'
     stage = 'prepare sources'
     try:
-        note(f'Bắt đầu run `{output}`. Chuẩn bị source từ `{args.swift_ref}` và `{args.adaptive_ref}`; repository gốc không bị sửa.')
+        note(f'Starting run: {output}. Source refs: {args.swift_ref}, {args.adaptive_ref}. Original working source is unchanged.')
         snapshots = output / 'snapshots'
         snapshots.mkdir()
         reference, adaptive = output / 'sources/swift', output / 'sources/adaptive'
@@ -302,11 +284,11 @@ def main():
         config.update(output_dir=str(output), sources=origins, warmup=False, metric_protocol=METRIC_PROTOCOL,
                       human_eval_completion_policy='raw, no stripping or repair')
         write_json(output / 'run_config.json', config)
-        note('Đã chuẩn bị source và lưu original ZIP, SOURCE_CHANGES.patch, metadata cấu hình. '
-             f'SWIFT `{origins["swift"]["commit"]}`, AdaptiveCache `{origins["adaptive"]["commit"]}`. Không chạy smoke test hoặc warm-up.')
+        note('Sources prepared; original ZIP, SOURCE_CHANGES.patch and configuration saved. '
+             f'SWIFT {origins["swift"]["commit"]}, AdaptiveCache {origins["adaptive"]["commit"]}. No smoke test or warm-up.')
         if args.prepare_only:
             write_json(output / 'status.json', {'status': 'prepared_only', 'inference_ran': False, 'pass1_evaluated': False})
-            note(f'Run `{output}` chỉ chuẩn bị source; chưa chạy GPU, chưa có điểm.')
+            note(f'Sources prepared only: {output}. No GPU inference or evaluation was run.')
             return
         stage = 'inference / HumanEval evaluation'
         rows = execute(args, output, reference, adaptive)
@@ -314,12 +296,12 @@ def main():
         table = '\n'.join(f'- seed {r["seed"]}, {r["dataset"]}/{r["method"]}: {r["tokens_per_second"]:.3f} tokens/s, '
                           f'speedup vs baseline {r["speedup_vs_baseline"]:.3f}x'
                           + (f', pass@1 {r["pass_at_1"]:.6f} ({r["passed"]}/164)' if 'pass_at_1' in r else '') for r in rows)
-        note(f'Run hoàn thành: `{output / "results.csv"}`.\n\n{table}\n\n'
-             'Các điểm là kết quả thực tế; pass@1 bằng nhau riêng lẻ không chứng minh bảo toàn toàn bộ phân phối.')
+        note(f'Run complete: {output / "results.csv"}\n\n{table}\n\n'
+             'Matching pass@1 alone does not establish preservation of the full output distribution.')
         print(f'\nDONE: {output / "results.csv"}', flush=True)
     except Exception as error:
         write_json(output / 'failure.json', {'status': 'failed', 'stage': stage, 'error': repr(error)})
-        note(f'Run `{output}` thất bại tại {stage}: {error}. Giữ nguyên artifact và log; không coi là run đầy đủ.')
+        note(f'Run failed: {output}; stage: {stage}; error: {error}. Partial artifacts retained; run is incomplete.')
         raise
 
 

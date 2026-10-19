@@ -66,7 +66,7 @@ To override Hugging Face model IDs, interpreter, or Git refs, use `LLAMA_MODEL_P
 
 ## Results and reproducibility
 
-Each run creates `_local/runs/h100_<UTC timestamp>/`. Read `results.csv` for decoding speed, speedups, acceptance metrics, token mismatches, and HumanEval pass@1. Per-task code correctness is in `seed_2024/humaneval.<method>.samples.jsonl_results.jsonl`; aggregate scores are in `humaneval.<method>.pass1.json`. `execution.log` records run progress and commands; separate inference and evaluation logs are kept alongside the outputs. The launcher does not append operational messages to `EXPERIMENT_LOG.md`, which documents design decisions and scientific interpretation.
+Each run creates `_local/runs/h100_<UTC timestamp>/`. Read `results.csv` for decoding speed, speedups, acceptance metrics, token mismatches, and HumanEval pass@1. Per-task code correctness is in `seed_2024/humaneval.<method>.samples.jsonl_results.jsonl`; aggregate scores are in `humaneval.<method>.pass1.json`. Commands, downloads, inference progress, optimization and evaluator output stream directly to the terminal with unbuffered Python output. The launcher creates no text log files and does not append operational messages to `EXPERIMENT_LOG.md`.
 
 ### Speed metric protocol
 
@@ -92,9 +92,9 @@ Original Git snapshots are saved under `snapshots/`. The executed source copies 
 
 Common corrections preserve HumanEval indentation, export evaluator-compatible task IDs/completions, honor output paths, and enforce output token/EOS boundaries. They are applied equally to both source copies. Cache behavior is defined by the AdaptiveCache branch itself, not by the launcher. Search and acceptance functions in the original model utilities are not rewritten. See [EXPERIMENT_LOG.md](EXPERIMENT_LOG.md) for the decisions and current execution status. There are no H100 measurements or accuracy claims in this repository yet.
 
-HumanEval executes generated Python; use the evaluation environment intended for generated code. A failed inference or evaluator step stops the run and leaves `failure.json` and its logs. A successful run produces `status.json` with `status: complete`. Token mismatches are reported for analysis and do not suppress pass@1 evaluation.
+HumanEval executes generated Python; use the evaluation environment intended for generated code. A failed inference or evaluator step prints its traceback directly to the terminal, stops the run and leaves `failure.json` with partial result artifacts. A successful run produces `status.json` with `status: complete`. Token mismatches are reported for analysis and do not suppress pass@1 evaluation.
 
-On subprocess failure the runner includes the last 80 log lines in the terminal error, up to 20,000 characters; the complete log remains on disk. For older runner versions that show only `CalledProcessError`, inspect `tail -n 100 _local/runs/<run>/seed_2024/cnndm.baseline.log` to find the actual baseline failure. Do not infer the cause from exit status alone.
+For failures, use the original subprocess traceback printed before the runner error, not exit status alone. LLaMA-2 access requires a Hugging Face account approved for `meta-llama/Llama-2-13b-hf` and authentication on the server. A 401/GatedRepoError at model download is an access issue; installing packages or changing the decoding algorithm does not grant model access.
 
 ## What to commit
 
