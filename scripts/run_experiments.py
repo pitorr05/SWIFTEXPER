@@ -1,5 +1,6 @@
 """One-shot H100 experiments: CNN/DM, HumanEval, and automatic pass@1."""
 import argparse
+from collections import deque
 import csv
 from datetime import datetime, timezone
 import difflib
@@ -78,12 +79,22 @@ def save_changes(folder, original):
 
 def run(command, cwd, logfile):
     note(f'RUN {shlex.join(map(str, command))}\nLOG {logfile}')
-    with open(logfile, 'x', encoding='utf-8') as stream:
-        try:
+    try:
+        with open(logfile, 'x', encoding='utf-8') as stream:
             subprocess.run(list(map(str, command)), cwd=cwd, stdout=stream,
                            stderr=subprocess.STDOUT, check=True)
-        except subprocess.CalledProcessError as error:
-            raise RuntimeError(f'Command failed (exit {error.returncode}); see {logfile}') from error
+    except subprocess.CalledProcessError as error:
+        # Close the writer first, then surface the actual child traceback, not just exit status.
+        try:
+            with open(logfile, encoding='utf-8', errors='replace') as stream:
+                tail = ''.join(deque(stream, maxlen=80))[-20000:].rstrip()
+        except OSError as read_error:
+            tail = f'Could not read subprocess log: {read_error}'
+        if not tail:
+            tail = '(Subprocess produced no output.)'
+        raise RuntimeError(f'Command failed (exit {error.returncode}); full log: {logfile}\n'
+                           f'--- last subprocess log lines ---\n{tail}\n'
+                           '--- end subprocess log ---') from error
 
 
 def check_environment(output):

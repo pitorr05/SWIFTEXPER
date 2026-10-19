@@ -94,6 +94,8 @@ Common corrections preserve HumanEval indentation, export evaluator-compatible t
 
 HumanEval executes generated Python; use the evaluation environment intended for generated code. A failed inference or evaluator step stops the run and leaves `failure.json` and its logs. A successful run produces `status.json` with `status: complete`. Token mismatches are reported for analysis and do not suppress pass@1 evaluation.
 
+On subprocess failure the runner includes the last 80 log lines in the terminal error, up to 20,000 characters; the complete log remains on disk. For older runner versions that show only `CalledProcessError`, inspect `tail -n 100 _local/runs/<run>/seed_2024/cnndm.baseline.log` to find the actual baseline failure. Do not infer the cause from exit status alone.
+
 ## What to commit
 
 Commit the experiment tools, documentation, ignore rules, and intended source changes. Do not commit `_local/`: it contains archived local work and generated artifacts, not source required by the runner. Old tracked `.pyc` files are removed; Python regenerates them when needed.
