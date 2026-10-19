@@ -24,6 +24,7 @@ SWIFTEXPER/
 │   ├── run_h100.sh             # Main experiment entrypoint
 │   ├── run_experiments.py      # Runs inference and collects results
 │   ├── evaluate_humaneval.py   # Exports completions and computes pass@1
+│   ├── summarize_results.py    # Recalculates speed metrics from existing runs
 │   ├── source_patches.py       # Applies documented source corrections
 │   └── assets/                # Shared evaluation harness only
 └── _local/                    # Ignored by Git; never needed when deploying
@@ -65,7 +66,27 @@ To override Hugging Face model IDs, interpreter, or Git refs, use `LLAMA_MODEL_P
 
 ## Results and reproducibility
 
-Each run creates `_local/runs/h100_<UTC timestamp>/`. Read `results.csv` for total inference throughput, speedups, acceptance metrics, token mismatches, and HumanEval pass@1. Per-task code correctness is in `seed_2024/humaneval.<method>.samples.jsonl_results.jsonl`; aggregate scores are in `humaneval.<method>.pass1.json`. Separate inference and evaluation logs are kept alongside the outputs.
+Each run creates `_local/runs/h100_<UTC timestamp>/`. Read `results.csv` for decoding speed, speedups, acceptance metrics, token mismatches, and HumanEval pass@1. Per-task code correctness is in `seed_2024/humaneval.<method>.samples.jsonl_results.jsonl`; aggregate scores are in `humaneval.<method>.pass1.json`. Separate inference and evaluation logs are kept alongside the outputs.
+
+### Speed metric protocol
+
+The primary protocol, `swift_author_code_v1`, follows the authors' [`evaluation_llama/speed.py`](https://github.com/hemingkx/SWIFT/blob/main/evaluation_llama/speed.py). For each method, with output count `n_i` and inference time `t_i` for task `i`:
+
+```text
+tokens_per_second   = mean(n_i / t_i)
+speedup_vs_baseline = tokens_per_second(method) / tokens_per_second(baseline)
+speedup_vs_swift    = tokens_per_second(method) / tokens_per_second(SWIFT)
+```
+
+The primary speedup is the ratio of mean speeds, not the mean of per-task speedups. Secondary fields are explicitly separate: `global_tokens_per_second = sum(n_i) / sum(t_i)`, `global_throughput_speedup_vs_*`, and `inference_time_speedup_vs_*`. Summary/comparison JSON, CSV, run configuration, and inference metadata record `metric_protocol` to distinguish the primary convention.
+
+Earlier runner versions used global throughput in the primary CSV columns and did not record this metric protocol. Do not mix those primary columns with new results. For a completed old run, recompute the metrics from its per-task JSONL and reuse its existing HumanEval scores:
+
+```bash
+python scripts/summarize_results.py --run-dir _local/runs/h100_<timestamp>
+```
+
+This produces `results.swift_author_code_v1.csv` and `metrics.swift_author_code_v1.json`, keeping the original outputs, summary sidecars, CSV, and pass@1 files unchanged. It does not execute inference or HumanEval. If these versioned files already exist, select a new `--output-dir`. This protocol identifier specifies speed aggregation; it does not claim an unchanged upstream runtime. The source corrections documented below still apply.
 
 Original Git snapshots are saved under `snapshots/`. The executed source copies are under `sources/`, with `SOURCE_PROVENANCE.json` and `SOURCE_CHANGES.patch` documenting the source commit and every applied correction. The exact launcher and patch assets are preserved under `driver/`.
 

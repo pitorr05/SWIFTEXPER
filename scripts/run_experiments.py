@@ -18,7 +18,7 @@ import zipfile
 SCRIPTS = Path(__file__).resolve().parent
 REPO = SCRIPTS.parent
 sys.path.insert(0, str(SCRIPTS / 'assets'))
-from research_utils import aggregate, read_records, validate_pair, write_json
+from research_utils import METRIC_PROTOCOL, aggregate, compare_aggregates, read_records, validate_pair, write_json
 from source_patches import prepare
 
 
@@ -103,7 +103,7 @@ def check_environment(output):
     run(['nvidia-smi'], REPO, output / 'nvidia-smi.log')
 
 
-def compare_task(folder, task, expected):
+def compare_task(folder, task, expected, write_comparison=True):
     methods = ('baseline', 'swift', 'adaptive')
     records = {method: read_records(folder / f'{task}.{method}.jsonl') for method in methods}
     manifests = []
@@ -131,17 +131,19 @@ def compare_task(folder, task, expected):
         mismatches = [r['task_id'] for r, b in zip(records[method], records[base])
                       if r['output_token_ids'] != b['output_token_ids']]
         comparisons[f'{method}_vs_{base}'] = {
-            'throughput_speedup': summaries[method]['tokens_per_second']/summaries[base]['tokens_per_second'],
-            'inference_time_speedup': summaries[base]['inference_seconds']/summaries[method]['inference_seconds'],
+            **compare_aggregates(summaries[method], summaries[base]),
             'token_mismatch_task_ids': mismatches, 'token_mismatch_count': len(mismatches)}
         if mismatches:
             print(f'NOTE: {task}/{method} vs {base}: {len(mismatches)} token mismatches; retained for analysis.', flush=True)
-    write_json(folder / f'{task}.comparisons.json', comparisons)
+    if write_comparison:
+        write_json(folder / f'{task}.comparisons.json', comparisons)
     return summaries, comparisons
 
 
-FIELDS = ['seed', 'dataset', 'model', 'method', 'samples', 'tokens', 'inference_seconds',
-          'tokens_per_second', 'speedup_vs_baseline', 'speedup_vs_swift', 'mean_accepted_length',
+FIELDS = ['metric_protocol', 'seed', 'dataset', 'model', 'method', 'samples', 'tokens', 'inference_seconds',
+          'tokens_per_second', 'speedup_vs_baseline', 'speedup_vs_swift',
+          'global_tokens_per_second', 'global_throughput_speedup_vs_baseline', 'global_throughput_speedup_vs_swift',
+          'inference_time_speedup_vs_baseline', 'inference_time_speedup_vs_swift', 'mean_accepted_length',
           'acceptance_rate', 'cache_hit_rate', 'embedding_seconds', 'search_seconds',
           'token_mismatch_vs_baseline', 'pass_at_1', 'passed', 'evaluated', 'pass_at_1_delta_vs_baseline']
 
@@ -154,6 +156,33 @@ def write_results(output, rows):
         writer.writeheader()
         writer.writerows(rows)
     os.replace(temporary, target)
+
+
+def build_result_rows(seed, task, model, summaries, comparisons, scores):
+    rows = []
+    for method in ('baseline', 'swift', 'adaptive'):
+        summary = summaries[method]
+        baseline_ratio = compare_aggregates(summary, summaries['baseline'])
+        swift_ratio = compare_aggregates(summary, summaries['swift'])
+        row = {key: summary[key] for key in ('metric_protocol', 'samples', 'tokens', 'inference_seconds',
+               'tokens_per_second', 'global_tokens_per_second', 'mean_accepted_length', 'acceptance_rate',
+               'cache_hit_rate', 'embedding_seconds', 'search_seconds')}
+        row.update(seed=seed, dataset=task, model=model, method=method,
+                   speedup_vs_baseline=baseline_ratio['speedup_ratio'],
+                   speedup_vs_swift=swift_ratio['speedup_ratio'],
+                   global_throughput_speedup_vs_baseline=baseline_ratio['global_throughput_speedup'],
+                   global_throughput_speedup_vs_swift=swift_ratio['global_throughput_speedup'],
+                   inference_time_speedup_vs_baseline=baseline_ratio['inference_time_speedup'],
+                   inference_time_speedup_vs_swift=swift_ratio['inference_time_speedup'],
+                   token_mismatch_vs_baseline=0 if method == 'baseline' else
+                   comparisons[f'{method}_vs_baseline']['token_mismatch_count'])
+        if method == 'baseline':
+            row['acceptance_rate'] = None
+        if scores:
+            row.update(pass_at_1=scores[method]['pass@1'], passed=scores[method]['passed'], evaluated=164,
+                       pass_at_1_delta_vs_baseline=scores[method]['pass@1']-scores['baseline']['pass@1'])
+        rows.append(row)
+    return rows
 
 
 def execute(args, output, reference, adaptive):
@@ -201,21 +230,7 @@ def execute(args, output, reference, adaptive):
                     scores[method] = json.loads(score_path.read_text(encoding='utf-8'))
                     note(f'HumanEval `{method}`, seed {seed}: pass@1 = {scores[method]["pass@1"]:.6f}, '
                          f'{scores[method]["passed"]}/164 bài đạt. Chi tiết `{score_path}`.')
-            for method in methods:
-                summary = summaries[method]
-                row = {key: summary[key] for key in ('samples', 'tokens', 'inference_seconds', 'tokens_per_second',
-                       'mean_accepted_length', 'acceptance_rate', 'cache_hit_rate', 'embedding_seconds', 'search_seconds')}
-                row.update(seed=seed, dataset=task, model=model, method=method,
-                           speedup_vs_baseline=summary['tokens_per_second']/summaries['baseline']['tokens_per_second'],
-                           speedup_vs_swift=summary['tokens_per_second']/summaries['swift']['tokens_per_second'],
-                           token_mismatch_vs_baseline=0 if method == 'baseline' else
-                           comparisons[f'{method}_vs_baseline']['token_mismatch_count'])
-                if method == 'baseline':
-                    row['acceptance_rate'] = None
-                if scores:
-                    row.update(pass_at_1=scores[method]['pass@1'], passed=scores[method]['passed'], evaluated=164,
-                               pass_at_1_delta_vs_baseline=scores[method]['pass@1']-scores['baseline']['pass@1'])
-                rows.append(row)
+            rows.extend(build_result_rows(seed, task, model, summaries, comparisons, scores))
             write_results(output, rows)
             note(f'Đã tổng hợp {task}, seed {seed}, vào `{output / "results.csv"}`. '
                  'Token mismatch được báo cáo, không tự coi là lỗi evaluator hoặc bảo toàn chất lượng.')
@@ -266,7 +281,7 @@ def main():
         bundle = output / 'driver'
         shutil.copytree(SCRIPTS, bundle, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
         config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
-        config.update(output_dir=str(output), sources=origins, warmup=False,
+        config.update(output_dir=str(output), sources=origins, warmup=False, metric_protocol=METRIC_PROTOCOL,
                       human_eval_completion_policy='raw, no stripping or repair')
         write_json(output / 'run_config.json', config)
         note('Đã chuẩn bị source và lưu original ZIP, SOURCE_CHANGES.patch, metadata cấu hình. '

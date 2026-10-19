@@ -1,7 +1,10 @@
 """Small, dependency-free helpers shared by both research checkouts."""
 import hashlib
 import json
+import math
 from pathlib import Path
+
+METRIC_PROTOCOL = 'swift_author_code_v1'
 
 
 def digest(value):
@@ -58,20 +61,28 @@ def export_humaneval(source, destination, expected_count=164, expected_ids=None)
 
 
 def aggregate(records):
+    if not records:
+        raise ValueError('Cannot aggregate an empty run')
     choices = [r['choices'][0] for r in records]
     times = [sum(c['wall_time']) for c in choices]
     counts = [sum(c['new_tokens']) for c in choices]
-    if any(t <= 0 for t in times):
-        raise ValueError('All inference times must be positive')
+    if any(not math.isfinite(t) or t <= 0 for t in times):
+        raise ValueError('All inference times must be finite and positive')
+    if any(not math.isfinite(n) or n < 0 for n in counts):
+        raise ValueError('All output token counts must be finite and nonnegative')
+    # Original SWIFT speed.py: mean(tokens_i / time_i), not total tokens / total time.
+    mean_sample_speed = sum(n/t for n, t in zip(counts, times)) / len(times)
     lengths = [n for c in choices for n in c['accept_lengths']]
     draft = sum(c.get('draft_token_num', 0) for c in choices)
     accepted = sum(c.get('accepted_draft_tokens', 0) for c in choices)
     cache = [r.get('forward_metrics', {}) for r in records]
     attempts = [m for m in cache if m.get('cache_enabled')]
     return {
+        'metric_protocol': METRIC_PROTOCOL,
         'samples': len(records), 'tokens': sum(counts), 'inference_seconds': sum(times),
-        'tokens_per_second': sum(counts) / sum(times),
-        'mean_sample_tokens_per_second': sum(n/t for n, t in zip(counts, times)) / len(times),
+        'tokens_per_second': mean_sample_speed,
+        'mean_sample_tokens_per_second': mean_sample_speed,
+        'global_tokens_per_second': sum(counts) / sum(times),
         'mean_accepted_length': sum(lengths) / len(lengths) if lengths else None,
         'draft_token_num': draft, 'accepted_draft_tokens': accepted,
         'acceptance_rate': accepted / draft if draft else None,
@@ -82,4 +93,16 @@ def aggregate(records):
         'cache_update_seconds': sum(m.get('cache_update_seconds', 0) for m in cache),
         'optimization_host_seconds': sum(m.get('optimization_host_seconds', 0) for m in cache),
         'optimization_gpu_ms': sum(m.get('optimization_gpu_ms', 0) for m in cache),
+    }
+
+
+def compare_aggregates(method, baseline):
+    """The primary speedup is the ratio of means, never the mean of per-task speedups."""
+    if method.get('metric_protocol') != METRIC_PROTOCOL or baseline.get('metric_protocol') != METRIC_PROTOCOL:
+        raise ValueError('Recompute both aggregates from per-task JSONL using the current metric protocol')
+    return {
+        'metric_protocol': METRIC_PROTOCOL,
+        'speedup_ratio': method['tokens_per_second'] / baseline['tokens_per_second'],
+        'global_throughput_speedup': method['global_tokens_per_second'] / baseline['global_tokens_per_second'],
+        'inference_time_speedup': baseline['inference_seconds'] / method['inference_seconds'],
     }

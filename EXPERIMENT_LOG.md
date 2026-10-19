@@ -4,6 +4,8 @@
 
 > Cập nhật kiến trúc mới nhất: code cache đã được chuyển trực tiếp vào nhánh `AdaptiveCache` (commit local `fec8d32`). `scripts/assets/` chỉ còn harness đánh giá chung, không còn bản cache hoặc wrapper thay thế. Cần push cả nhánh contribution và main trước khi server chạy phiên bản runner này.
 
+> Cập nhật metric: chỉ số chính hiện theo `swift_author_code_v1`: trung bình tokens/s từng bài, speedup là tỷ số hai trung bình, đúng công thức trong code tác giả SWIFT. Throughput tổng có tên riêng `global_tokens_per_second`. Các mục lịch sử nói throughput tổng là chỉ số chính thuộc phiên bản cũ; xem mục khôi phục metric ở cuối file.
+
 ## 2026-10-20 — Phạm vi và trạng thái
 
 Mục tiêu là một lệnh chạy trên H100: CNN/DailyMail 1.000 bài với LLaMA-2-13B, rồi HumanEval 164 bài với CodeLLaMA-13B; mỗi bộ chạy baseline, SWIFT từ `main` và AdaptiveCache từ nhánh contribution. HumanEval được chấm pass@1 tự động. Mọi ghi chú triển khai và kết quả sẽ nối tiếp trong file này; không tạo báo cáo Markdown riêng.
@@ -212,3 +214,25 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/run_h100.sh
 ```
 
 Chỉ hoàn thành công bố source; chưa chạy job trên server H100 hoặc báo điểm pass@1. Output thực tế sẽ nằm trong `_local/runs/` và được ghi tiếp vào nhật ký khi script chạy trên server.
+
+## Khôi phục chỉ số tốc độ chính theo code tác giả SWIFT
+
+Đã đọc lại §5.1/Appendix B.3 và đối chiếu `evaluation_llama/speed.py` chính thức. Paper nêu decoding speed và wall-time speedup nhưng phần metric không ghi rõ phép tổng hợp tốc độ qua các bài; code công khai của tác giả tính `mean(tokens_i / time_i)` và tỷ số hai trung bình. Việc phiên bản runner trước dùng `sum(tokens_i) / sum(time_i)` làm chỉ số chính là thay đổi protocol không phù hợp mục tiêu đối chiếu SWIFT. Đây là sửa metric; không khẳng định mọi paper dùng chung một phép tổng hợp.
+
+Đã cập nhật aggregation, summary JSON, comparison JSON, bảng CSV, run config và metadata inference sang `metric_protocol: swift_author_code_v1`. `tokens_per_second` là trung bình tokens/s từng bài; `speedup_vs_baseline`/`speedup_vs_swift` là tỷ số hai trung bình. Không dùng trung bình các speedup từng bài. Throughput tổng chỉ còn ở `global_tokens_per_second` và `global_throughput_speedup_vs_*`; tỷ số tổng thời gian nằm ở `inference_time_speedup_vs_*`. Công cụ phân tích sử dụng cùng helper để không lệch công thức giữa runner và xử lý riêng.
+
+Thêm `scripts/summarize_results.py` để tính lại số liệu từ JSONL của run đã hoàn tất, tái sử dụng điểm HumanEval đã có, không chạy GPU hoặc evaluator. Công cụ ghi `results.swift_author_code_v1.csv` và `metrics.swift_author_code_v1.json`, không ghi đè CSV/JSONL/metadata/summary/pass@1 cũ; ghi protocol nguồn là legacy nếu run cũ chưa có marker. Cần đủ output và điểm cũ hợp lệ, hoặc công cụ báo lỗi rõ. File versioned đã tồn tại thì chọn output-dir khác.
+
+```bash
+python scripts/summarize_results.py --run-dir _local/runs/h100_<timestamp>
+```
+
+Lần sửa này không đổi thuật toán, nhánh contribution, generation parameters hoặc HumanEval evaluator. Các chỉnh sửa runtime đã công bố trước đó vẫn tồn tại, nên việc đổi metric không biến implementation đang đo thành bản upstream nguyên trạng. Công thức tham chiếu: https://github.com/hemingkx/SWIFT/blob/main/evaluation_llama/speed.py .
+
+### Xác minh metric
+
+Đã chạy kiểm tra số học local trong `_local/verification/check_swift_metrics.py` (không đưa lên Git). Fixture có token/time khác nhau giữa bài để phân biệt ba phép tính: công thức tác giả cho speedup 1.5, throughput tổng cho 4/3, còn trung bình speedup từng bài cho 1.625. Kết quả primary của helper mới khớp trực tiếp hàm `speed()` trong file gốc không chỉnh sửa. Đây là số học dữ liệu tổng hợp, không phải kết quả model.
+
+Đã xác minh quy trình tính lại trên fixture tổng hợp đủ 1.000 CNN/DM và 164 HumanEval mỗi phương pháp: xuất đúng 6 dòng CSV có protocol, đồng nhất với row builder của runner, giữ byte của CSV/summary/JSONL/pass@1 cũ, từ chối ghi đè file versioned đã có. Kiểm tra còn bao gồm input thời gian không hợp lệ và không dùng aggregate thiếu version marker. Không chạy inference, không gọi HumanEval evaluator, không sinh điểm khoa học mới.
+
+Đã kiểm tra syntax Python 3.9 cho 8 file Python trong scripts và Bash syntax của launcher; không đổi requirements. Bộ sửa sẽ được commit/push trên main để server pull; AdaptiveCache vẫn ở commit `fec8d32`, không có thay đổi của lần sửa metric này.

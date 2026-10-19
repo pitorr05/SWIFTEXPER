@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from tqdm import tqdm
-from evaluation_llama.research_utils import aggregate, digest, validate_output_path, write_json
+from evaluation_llama.research_utils import METRIC_PROTOCOL, aggregate, digest, validate_output_path, write_json
 from evaluation_llama.phase_timer import finish_request
 
 
@@ -88,7 +88,7 @@ def source_metadata(config, model):
             packages[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             packages[name] = None
-    return {'schema_version': 1, 'config': config, 'source': provenance,
+    return {'schema_version': 1, 'metric_protocol': METRIC_PROTOCOL, 'config': config, 'source': provenance,
             'source_sha256': {str(p.relative_to(root)): digest(p.read_text(encoding='utf-8')) for p in files},
             'python': platform.python_version(), 'platform': platform.platform(), 'packages': packages,
             'cuda_runtime': torch.version.cuda,
