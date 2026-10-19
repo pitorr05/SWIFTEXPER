@@ -58,7 +58,8 @@ def main():
     args = parser.parse_args()
     csv_path, json_path = summarize(args.run_dir, args.output_dir)
     note(f'Đã tính lại metric tốc độ từ `{args.run_dir.resolve()}` theo `{METRIC_PROTOCOL}`: '
-         f'`{csv_path}` và `{json_path}`. Không chạy inference/evaluator; giữ nguyên JSONL, pass@1 và CSV cũ.')
+         f'`{csv_path}` và `{json_path}`. Không chạy inference/evaluator; giữ nguyên JSONL, pass@1 và CSV cũ.',
+         log_path=csv_path.parent / 'execution.log')
 
 
 if __name__ == '__main__':

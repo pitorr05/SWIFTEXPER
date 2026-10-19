@@ -66,7 +66,7 @@ To override Hugging Face model IDs, interpreter, or Git refs, use `LLAMA_MODEL_P
 
 ## Results and reproducibility
 
-Each run creates `_local/runs/h100_<UTC timestamp>/`. Read `results.csv` for decoding speed, speedups, acceptance metrics, token mismatches, and HumanEval pass@1. Per-task code correctness is in `seed_2024/humaneval.<method>.samples.jsonl_results.jsonl`; aggregate scores are in `humaneval.<method>.pass1.json`. Separate inference and evaluation logs are kept alongside the outputs.
+Each run creates `_local/runs/h100_<UTC timestamp>/`. Read `results.csv` for decoding speed, speedups, acceptance metrics, token mismatches, and HumanEval pass@1. Per-task code correctness is in `seed_2024/humaneval.<method>.samples.jsonl_results.jsonl`; aggregate scores are in `humaneval.<method>.pass1.json`. `execution.log` records run progress and commands; separate inference and evaluation logs are kept alongside the outputs. The launcher does not append operational messages to `EXPERIMENT_LOG.md`, which documents design decisions and scientific interpretation.
 
 ### Speed metric protocol
 

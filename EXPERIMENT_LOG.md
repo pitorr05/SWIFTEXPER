@@ -1,238 +1,133 @@
-# Nhật ký thực nghiệm SWIFT và AdaptiveCache
+# SWIFT và AdaptiveCache — thiết kế, logic sửa code và diễn giải thực nghiệm
 
-> Bố cục hiện hành: bắt đầu từ `Readme.md`, chạy bằng `scripts/run_h100.sh`. Toàn bộ tài liệu và artifact local ở `_local/` (không đưa lên Git); output mới mặc định ở `_local/runs/`. Các đường dẫn `research/`, `runs/`, `Paper/` trong những mục cũ dưới đây là lịch sử trước khi dọn repo.
+Tài liệu này giải thích implementation đang được đo, lý do thay đổi và những kết luận dữ liệu có thể hỗ trợ. Đây là ngữ cảnh để tiếp tục phát triển code và viết paper; không phải nhật ký thao tác Git hoặc output terminal. Chỉ cập nhật khi có quyết định thiết kế, đổi protocol hay kết quả thực nghiệm có ý nghĩa. Tiến trình từng lần chạy nằm trong `execution.log` của run, không tự nối vào tài liệu này.
 
-> Cập nhật kiến trúc mới nhất: code cache đã được chuyển trực tiếp vào nhánh `AdaptiveCache` (commit local `fec8d32`). `scripts/assets/` chỉ còn harness đánh giá chung, không còn bản cache hoặc wrapper thay thế. Cần push cả nhánh contribution và main trước khi server chạy phiên bản runner này.
+## 1. Câu hỏi nghiên cứu và ba phương pháp
 
-> Cập nhật metric: chỉ số chính hiện theo `swift_author_code_v1`: trung bình tokens/s từng bài, speedup là tỷ số hai trung bình, đúng công thức trong code tác giả SWIFT. Throughput tổng có tên riêng `global_tokens_per_second`. Các mục lịch sử nói throughput tổng là chỉ số chính thuộc phiên bản cũ; xem mục khôi phục metric ở cuối file.
+Mục tiêu là kiểm tra khả năng tái sử dụng cấu hình skipped layers giữa các request để cải thiện hiệu năng self-speculative decoding. Cần đo lợi ích sau toàn bộ chi phí cache và đánh giá HumanEval pass@1 để phát hiện suy giảm functional correctness.
 
-## 2026-10-20 — Phạm vi và trạng thái
+| Phương pháp | Nguồn và vai trò |
+|---|---|
+| Autoregressive | `evaluation_llama/inference_baseline.py` từ main; mốc target model dùng `model.generate()` |
+| SWIFT | Code của tác giả paper trên main; mốc self-speculative decoding, có tối ưu layer set xuyên input stream |
+| AdaptiveCache | Nhánh contribution; truy hồi layer set bằng embedding đầu vào, cosine similarity và cache online |
 
-Mục tiêu là một lệnh chạy trên H100: CNN/DailyMail 1.000 bài với LLaMA-2-13B, rồi HumanEval 164 bài với CodeLLaMA-13B; mỗi bộ chạy baseline, SWIFT từ `main` và AdaptiveCache từ nhánh contribution. HumanEval được chấm pass@1 tự động. Mọi ghi chú triển khai và kết quả sẽ nối tiếp trong file này; không tạo báo cáo Markdown riêng.
+Mốc đối chiếu source upstream là commit `a0b0256`; contribution trước sửa là `bed8683`, sau sửa vòng đời cache là `fec8d32`. Code Python của thuật toán upstream trên main được giữ nguyên. Tuy nhiên, runner xuất source từ Git rồi áp dụng chuẩn hóa vào bản thực thi. **Source nguyên bản được lưu không có nghĩa phép đo chạy implementation nguyên trạng.**
 
-Code tracked của repository gốc chưa bị sửa. Lần triển khai trước đã tạo hai local clone trong `research/` và các thay đổi chưa hoàn tất. Runner chính mới không sử dụng các clone đó: mỗi run xuất source từ Git ref gốc rồi áp dụng các sửa đổi có ghi diff trong thư mục run. Snapshot nguồn và code sau sửa đều được lưu để truy nguyên.
+Phần model, random/Bayesian search và acceptance trong `model/swift/` không bị runner viết lại. AdaptiveCache đã được sửa trực tiếp trên nhánh contribution; scripts không chèn một implementation cache khác vào nhánh đó. Bản thực thi và diff của từng run là bằng chứng xác định chính xác code đã đo.
 
-Các ghi chú trước đây đã được hợp nhất: đã xác định output HumanEval thiếu schema evaluator, `.strip()` làm mất indentation, prompt bị đổi spaces thành tab, `--answer-file` bị bỏ qua, điều kiện dừng có thể trả token quá ngân sách/EOS. Nhánh AdaptiveCache có vấn đề reset layer set nhưng giữ optimizer, LRU cập nhật key query thay vì key tìm trúng và embedding có thể gặp tree mask cũ. Đây là các vấn đề implementation; chưa phải bằng chứng thuật toán SWIFT cốt lõi sai.
+## 2. Protocol thực nghiệm hiện tại
 
-Quyết định hiện hành: sửa chung phần dữ liệu/output và giới hạn token/EOS ở cả hai bản làm việc; giữ thuật toán search/acceptance gốc. Sửa vòng đời cache riêng phía contribution. Cache miss tiếp nối incumbent của stream; cache hit chỉ thay cấu hình cho request hiện tại. Tính đầy đủ embedding/search vào thời gian. Giữ BO random_state=1 của tác giả; data seed cố định 2024, run seed mặc định 2024. Không thêm smoke test, warm-up hoặc chặn chạy đầy đủ vì token mismatch.
+| Tác vụ | Model Hugging Face | Số bài | Prompt | Max new tokens |
+|---|---|---:|---|---:|
+| CNN/DailyMail | `meta-llama/Llama-2-13b-hf` | 1.000 | 1-shot; test set 3.0.0, exemplar từ train | 64 |
+| HumanEval | `codellama/CodeLlama-13b-hf` | 164 | Function prompt gốc, giữ indentation | 512 |
 
-Máy local có torch 2.7.1+cu118, transformers 5.5.0 và không có CUDA; chưa chạy inference H100, chưa có pass@1 hoặc speedup. Môi trường server đang dùng được giữ nguyên, script không tự nâng dependency.
+CNN/DailyMail giới hạn **64 token**. Hai model là target model cho hai tác vụ, không phải cặp target/draft; cả ba phương pháp trên cùng dataset đều dùng cùng target model.
 
-## 2026-10-20 — Runner và đánh giá đã triển khai
+Cấu hình chung: một GPU H100, batch size 1, float16, greedy (`temperature=0`). Top-p được truyền là 0.85 cho CNN/DM và 0.95 cho HumanEval nhưng không ảnh hưởng lựa chọn token khi greedy. Model được tải qua ID Hugging Face hoặc cache của môi trường.
 
-Đã tạo `scripts/run_h100.sh`, runner Python, helper chấm HumanEval và assets áp dụng vào source tạm. Mặc định chạy đủ 1.000/164 bài, không smoke test/warm-up, seed 2024; `--seeds 2024 2025 2026` dùng cho đợt lặp và tự luân phiên thứ tự phương pháp. Cache bắt đầu rỗng mỗi process, không dùng persistence. Sau mỗi giai đoạn runner ghi tiếp vào chính file này.
+Data seed cố định 2024, quyết định tập CNN/DM, thứ tự và exemplar. Run seed mặc định 2024, có thể lặp 2025/2026 trong khi giữ data seed. HumanEval chạy đủ 164 task. Manifest lưu ID, one-shot prompt và fingerprint; từng bản ghi lưu input token IDs/hash để xác nhận prompt thực tế giống nhau. Trường hợp CNN/DM vượt context, harness dùng cùng quy tắc cắt cho cả ba phương pháp; HumanEval quá dài sẽ báo lỗi thay vì cắt mất function prompt.
 
-Các sửa chung ở SWIFT và AdaptiveCache: output có task ID/token IDs, indentation nguyên bản, manifest dữ liệu, metadata môi trường/model, đường dẫn output thực sự được sử dụng, summary sidecar riêng; cắt prefix verified tại EOS/ngân sách và không draft thêm khi đã kết thúc. Giữ nguyên `model/swift/utils.py` của hai Git ref (không đổi search, acceptance hoặc điều kiện dừng tối ưu của tác giả). Baseline đặt eager attention cho phù hợp backend custom SWIFT. Những thay đổi này được xuất đầy đủ ở `SOURCE_CHANGES.patch`, không gán là novelty của contribution.
+SWIFT: skip ratio 0.45, context window 32, opt interval 1, Bayesian interval 25, tối đa 1.000 bước tối ưu, tolerance 300, max score 0.95. Giữ BO `random_state=1` của tác giả, nên đổi run seed không đồng nghĩa đổi mọi nguồn ngẫu nhiên của optimizer.
 
-AdaptiveCache được tách lớp và bọc quanh decoder chung để sửa nhất quán state trên hit/miss, LRU và tree mask; source nhánh trước sửa vẫn lưu trong original ZIP. Timer bao gồm forward embedding, search và update cache. Metadata ghi request nguồn của entry và việc incumbent có cải thiện ở request đó hay không. Vẫn dùng một forward embedding bổ sung, chưa thực hiện ablation tái sử dụng prefill.
+AdaptiveCache: threshold cosine 0.85, capacity 100, cache rỗng đầu mỗi process, không load cache từ run trước. Các giá trị này là cấu hình khởi đầu, chưa có bằng chứng tối ưu. Hiện không warm-up; số đo gồm giai đoạn khởi đầu của stream. Lặp nhiều seed sẽ luân phiên thứ tự phương pháp. Paper dùng phần cứng khác H100, nên không kỳ vọng khớp tuyệt đối tốc độ hoặc speedup trong bảng tác giả.
 
-Helper chấm gọi trực tiếp `human_eval.evaluation.evaluate_functional_correctness(k=[1])`. Nó kiểm tra đủ 164 ID duy nhất, bảo toàn completion, đối chiếu pass@1 với số boolean `passed` trong kết quả từng bài, rồi lưu `humaneval.<method>.pass1.json`. Không có điểm hoặc thiếu kết quả sẽ báo lỗi. Có kiểm tra tĩnh lời gọi exec trong evaluator cài đặt để không vô tình báo điểm từ bản đã vô hiệu hóa thực thi. Mã nguồn tham khảo: https://github.com/openai/human-eval/blob/master/human_eval/evaluation.py và https://github.com/openai/human-eval/blob/master/human_eval/execution.py .
+## 3. Các sửa chung so với implementation nguyên bản
 
-`results.csv` được cập nhật sau mỗi dataset gồm throughput tổng, speedup với baseline/SWIFT, mean accepted length, acceptance rate, token mismatch, cache metrics và pass@1 cho HumanEval. Token mismatch được ghi lại để nghiên cứu, không chặn evaluator. Không tự kết luận độ chính xác không giảm.
+| Hành vi cũ | Bản thực nghiệm hiện tại | Lý do và ảnh hưởng |
+|---|---|---|
+| Output HumanEval chỉ có choices, thiếu task ID/completion theo evaluator | Lưu task ID; export raw completion theo schema chính thức | Cho phép chấm đúng bài, tránh coi inference hoàn thành là đã có điểm |
+| Prompt đổi spaces thành tab; completion bị `.strip()` | Giữ prompt và indentation gốc; không sửa đáp án sau sinh | Tránh lỗi Python do xử lý output; thay prompt có thể thay generation so với script cũ |
+| SWIFT thêm cả nhóm verified rồi kiểm tra EOS và `>` max tokens | Chỉ commit prefix đến EOS/ngân sách; kết thúc trước optimization/draft tiếp | Cùng ràng buộc đầu ra; có thể thay số token, số bước tối ưu cuối request và latency so với upstream |
+| Baseline dùng attention backend mặc định của Transformers | Đặt eager attention cho baseline | Phù hợp backend custom SWIFT; có thể ảnh hưởng hiệu năng và sai khác số học của baseline |
+| Khai báo `--answer-file` nhưng vẫn tự đặt đường dẫn, ghi nối; summary lẫn bản ghi | Dùng đường dẫn chỉ định, từ chối output đã tồn tại, summary sidecar riêng | Tránh trộn run; không thay logic dự đoán |
+| Seed chọn data gắn với run seed | Tách data seed, xác nhận manifest/prompt giữa phương pháp | Giữ workload tương đương khi lặp seed |
+| Thông tin đo và source chưa đủ để truy nguyên | Lưu token IDs, cấu hình, model revision nếu có, source diff và timer optimization | Tăng khả năng audit; instrumentation vẫn có overhead và không được giả định miễn phí |
 
-### Cách chạy trên server
+**Cách mô tả baseline trong paper:** autoregressive dùng target model qua Hugging Face generate và eager attention; SWIFT dùng thuật toán gốc trong pipeline đánh giá đã chuẩn hóa, có sửa output/termination và instrumentation. Không viết “chạy code gốc hoàn toàn không thay đổi”. Phép tổng hợp metric đúng tác giả cũng không tự loại bỏ các khác biệt runtime này.
 
-Copy thư mục `scripts/` cùng file log này vào repository trên H100, có Git refs `main` và `origin/AdaptiveCache`. Không cần copy thư mục `research/` cũ hoặc output local. Kích hoạt môi trường SWIFT đã cài, bảo đảm có `human-eval` (đã nằm trong requirements của repo) và quyền tải/đọc model.
+Những sửa chung không phải novelty của AdaptiveCache. Nếu cần tái lập runtime upstream chính xác, phải thực hiện đối chứng riêng; kết quả runner hiện tại không tự cung cấp đối chứng đó. Chưa có đo H100 định lượng ảnh hưởng từng sửa chung.
 
-```bash
-cd /data/SWIFTEXPER
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_h100.sh
+## 4. AdaptiveCache: logic cũ, quyết định sửa và hệ quả
+
+### 4.1. Representation và lookup
+
+Mỗi prompt đi qua full model để lấy hidden state cuối. Mean pooling theo token, tích lũy ở float32 rồi L2-normalize; cosine similarity tìm entry gần nhất. Layer set gồm hai danh sách attention/MLP skip; hit khi similarity đạt threshold. LRU giới hạn số entry. Model weights không được huấn luyện thêm, nhưng hệ thống có bộ nhớ trạng thái bổ sung.
+
+**Vẫn có một forward embedding riêng trước prefill decoding.** Chưa tái sử dụng representation từ prefill. Nó có thể tốn nhiều thời gian với prompt dài; không được bỏ chi phí này khỏi speedup.
+
+### 4.2. Vì sao sửa quản lý trạng thái
+
+Incumbent là cấu hình skipped layers tốt nhất đang được SWIFT giữ cho stream; statistics/optimizer lưu điểm và ngân sách tìm kiếm tương ứng. Các thành phần này phải được quản lý nhất quán.
+
+| Vấn đề ở contribution cũ | Quyết định hiện tại | Hệ quả cần hiểu |
+|---|---|---|
+| Reset uniform layer mỗi request nhưng vẫn giữ score/optimizer và cờ dừng | Miss tiếp nối incumbent cùng trạng thái tối ưu xuyên request | Tránh layer set và điểm tối ưu không tương ứng; thay chính sách thực thi so với contribution cũ |
+| Hit thay cấu hình mà không tách rõ với incumbent của stream | Hit tạm dùng layer truy hồi, bỏ search request đó; finally khôi phục incumbent và cờ optimization | Cấu hình phục vụ query không ghi đè incumbent và state search của stream |
+| Embedding chạy trước reset tree mask | Reset mask và tắt draft mode trước full-model embedding | Tránh representation dùng mask còn từ request trước |
+| LRU move bằng key query | Move đúng key entry tìm trúng | Eviction phản ánh entry thực sự được dùng |
+| Empty cache không tăng miss; clear có thể diễn ra khi cache chưa tồn tại | Khởi tạo trước vòng chạy; tính empty miss; clear bỏ qua load | Thống kê và trạng thái đầu run có nghĩa rõ ràng |
+| Entry chỉ ghi embedding/layer set | Ghi task nguồn, số bước tối ưu trên request nguồn và incumbent có cải thiện hay không | Không diễn giải mọi entry là cấu hình đã tối ưu riêng cho prompt nguồn |
+
+Miss sau khi SWIFT đã early-stop **không tự khởi động tối ưu lại**. Cache có thể lưu incumbent kế thừa dù request nguồn không tối ưu. Vì vậy, implementation hiện tại chưa chứng minh khả năng tự phát hiện domain shift hoặc tìm layer set tối ưu cho từng query. Hit cũng chưa có bước kiểm tra cấu hình truy hồi có lợi hơn incumbent về latency hay không.
+
+Khi cache tắt, wrapper đi vào decoder mà không reset uniform mỗi request. SWIFT baseline chính vẫn chạy từ nhánh main, không được thay bằng tên gọi “AdaptiveCache tắt cache”.
+
+Chi phí embedding, tìm kiếm, thêm entry và khôi phục trạng thái nằm trong timer ngoài. Persistence tùy chọn có schema/model/protocol identity; benchmark mặc định không dùng persistence. Cache metrics giúp giải thích overhead, không thay thế số đo tổng thể.
+
+## 5. Chỉ số và phạm vi thời gian đo
+
+### 5.1. Chỉ số tốc độ chính theo code tác giả
+
+Với task i, `n_i` là số token đầu ra thực sự được trả về (kể cả EOS nếu có), `t_i` là thời gian forward được đồng bộ CUDA:
+
+```text
+V(method) = (1 / N) * sum_i(n_i / t_i)
+speedup_vs_baseline = V(method) / V(autoregressive)
+speedup_vs_swift    = V(method) / V(SWIFT)
 ```
 
-Nếu model đã nằm trong ổ đĩa server:
+Đây là công thức trong `evaluation_llama/speed.py` của tác giả; không phải trung bình speedup từng bài. Protocol có marker `swift_author_code_v1`. Paper nêu tốc độ và wall-time speedup nhưng phần metric không ghi rõ phép tổng hợp tốc độ qua từng bài; bằng chứng cho công thức trên là code công khai. Không khẳng định mọi paper dùng cùng phép tổng hợp.
 
-```bash
-CUDA_VISIBLE_DEVICES=0 \
-LLAMA_MODEL_PATH=/data/models/Llama-2-13b-hf \
-CODE_MODEL_PATH=/data/models/CodeLlama-13b-hf \
-bash scripts/run_h100.sh
-```
+Chỉ số bổ sung được đặt tên riêng: `global_tokens_per_second = sum(n_i) / sum(t_i)`; `global_throughput_speedup_vs_*` là tỷ số các throughput tổng; `inference_time_speedup_vs_*` là tỷ số tổng thời gian. Chúng có trọng số/ý nghĩa khác chỉ số chính. Nếu lượng token khác nhau, tỷ số thời gian tổng cũng không đồng nhất với tỷ số throughput tổng.
 
-Lặp ba seed sau đợt đầu:
+Phiên bản runner cũ chưa có marker từng dùng throughput tổng làm cột chính. Cần tính lại từ JSONL và xuất file versioned bằng `scripts/summarize_results.py`; không ghép cột chính cũ/mới như cùng protocol. Công cụ này giữ nguyên dữ liệu và điểm pass@1 cũ, không chạy lại model/evaluator.
 
-```bash
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_h100.sh --seeds 2024 2025 2026
-```
+### 5.2. Timer và chỉ số giải thích
 
-Các lựa chọn khác: `PYTHON_BIN` chọn interpreter, `SWIFT_REF`/`ADAPTIVE_REF` chọn Git ref, `OUTPUT_DIR` chọn thư mục run mới, `LLAMA_REVISION`/`CODE_REVISION` khóa model revision. Không dùng output đã tồn tại. Mặc định output là `runs/h100_<UTC timestamp>/`, từng seed có log và JSONL riêng. Log chung duy nhất là file này. Điểm HumanEval là tỷ lệ 0–1, ví dụ 0.311 tương đương 31.1%; chưa có số thực nghiệm ở thời điểm viết đoạn này. Evaluator thực thi code model sinh ra, nên dùng môi trường đánh giá cô lập trên server.
+Timer mỗi request đồng bộ CUDA trước/sau forward, gồm prefill, drafting, verification, optimization và toàn bộ xử lý cache. Không gồm tải model, tải dataset, tokenization, decode thành text, ghi JSONL hay chạy HumanEval evaluator. Vì vậy, đây là thời gian inference của request, không phải thời gian end-to-end của toàn bộ job và cũng không phải decode-only đã loại prefill.
 
-## 2026-10-20 — Bàn giao script
+Mean accepted length tính bằng tổng token commit qua các vòng verification chia số vòng đó. Acceptance rate dùng `sum(accept_length - 1) / sum(draft_steps)` theo cách đếm của implementation, không lấy tổng node trên token tree làm mẫu số. Với baseline, accepted length là 1 và acceptance rate để trống trong CSV. Các prefix cuối bị cắt theo EOS/ngân sách được tính theo token thực sự commit; số node tree đã verify và số accepted draft trước cắt được lưu riêng để thấy công việc đã làm.
 
-Đã kiểm tra cú pháp Python của scripts và source được xuất; `bash -n scripts/run_h100.sh` thành công với Git Bash. Đã chạy chế độ chỉ chuẩn bị source bằng `python scripts/run_experiments.py --prepare-only --output-dir runs/source_review_final_20261020`: xuất đúng hai commit, tạo original ZIP và diff; không gọi inference hay evaluator. Một lần kiểm tra local trước đó gặp lỗi encoding console Windows, đã sửa stdout/stderr UTF-8 và ghi rõ run thất bại trong log. Không có kết quả giả lập được báo cáo thành số liệu nghiên cứu.
+Timer optimization có host seconds và GPU-event milliseconds; không cộng hai số vì có thể chồng lấp. Hit rate tính trên số request lookup, gồm miss đầu khi cache rỗng. Các timer con không phải phân rã đầy đủ, không chồng lấp của toàn bộ latency; số đo quyết định vẫn là timer ngoài.
 
-Đã giữ tương thích phần ghi source với Python 3.9 của môi trường SWIFT gốc. `git diff --exit-code -- evaluation_llama model eval_llama.sh requirements.txt` xác nhận code tracked ban đầu không bị sửa. Các file báo cáo riêng tạo trước đây đã bỏ sau khi gộp nội dung vào file này; entrypoint cũ trong `research/` chuyển tiếp sang runner mới để tránh dùng quy trình smoke/warm-up đã hủy. `.gitignore` loại các bản local clone, output và bytecode khỏi việc commit nhầm.
+### 5.3. HumanEval pass@1
 
-Trạng thái cuối ở máy local: **đã chuẩn bị script và kiểm tra source/cú pháp; chưa chạy H100, chưa có pass@1 hoặc speedup thực tế**. Chạy lệnh server ở trên để thực hiện toàn bộ inference và chấm điểm. Mỗi run mới dùng source Git refs gốc cùng bản patch đi kèm, không cần copy `research/` hoặc `runs/` từ local.
+Chạy một completion greedy cho mỗi bài trong đủ 164 bài. Export `task_id` và completion không chứa prompt, giữ indentation; không sửa code theo kết quả test. Evaluator chính thức kiểm tra chức năng, timeout mặc định 3 giây/bài và 4 worker. Điểm trong cấu hình này là `số bài đạt / 164`; helper đối chiếu với boolean passed của kết quả từng bài và yêu cầu đầy đủ ID.
 
-## Chuyển bộ chạy lên Git để server pull
+Cần phân biệt evaluator thất bại với model có pass@1 thấp. Mục tiêu là tạo được điểm hợp lệ, không bảo đảm điểm dương hoặc bằng paper. Pass@1 bằng baseline là bằng chứng thực nghiệm trên benchmark này; riêng nó không chứng minh bảo toàn phân phối hoặc xác nhận mọi token giống nhau. Token mismatch được báo cáo độc lập, cần phân tích nguyên nhân; không chặn evaluator để vẫn thấy ảnh hưởng đến chất lượng.
 
-Chỉ đưa `.gitignore`, `scripts/` (gồm cả `assets/` và `.gitattributes`) và `EXPERIMENT_LOG.md` vào commit. Không đưa `research/`, `runs/`, `Paper/` hay `desktop.ini` vào commit này. Tại lần kiểm tra, các file bàn giao vẫn untracked; chưa tạo commit hoặc push.
+## 6. Bằng chứng cần có trước khi viết contribution
 
-Model mặc định là ID Hugging Face `meta-llama/Llama-2-13b-hf` và `codellama/CodeLlama-13b-hf`; không yêu cầu model có sẵn dưới `/data/models`. Thư viện tự tải hoặc dùng Hugging Face cache của môi trường hiện có. Trên server cần có cả ref `main` và `origin/AdaptiveCache`; runner không tự fetch nhánh để tránh thay đổi source ngoài ý muốn.
+Câu hỏi chính: **truy hồi layer set có cải thiện thời gian sau toàn bộ overhead, và trong điều kiện nào?** Lợi ích có thể đến từ giảm search hoặc cấu hình draft phù hợp hơn; chi phí có thể đến từ embedding, lookup và cấu hình truy hồi kém. Không dùng hit rate cao để suy ra speedup.
 
-```bash
-# Local: chỉ stage bộ bàn giao, không dùng git add .
-git add -- .gitignore scripts EXPERIMENT_LOG.md
-git commit -m "Add H100 experiment runner and HumanEval pass@1 evaluation"
-git push origin main
+| Giả thuyết cần kiểm chứng | Bằng chứng/đối chứng cần có |
+|---|---|
+| Lookup tiết kiệm chi phí thực | Speedup với cả AR và SWIFT; đo embedding/search/update và optimization, tính cả cache rỗng đầu stream |
+| Cosine phản ánh khả năng chuyển giao cấu hình | Đối chiếu similarity với lợi ích latency/acceptance từng request; so với giữ incumbent và chọn entry ngẫu nhiên |
+| Cache không chỉ nhớ một cấu hình của domain đồng nhất | Phân tích số layer set khác nhau, nguồn entry, vị trí trong stream và miss sau early-stop; sau đó mới khảo sát domain shift |
+| Thay đổi giúp nhiều chế độ workload | Phân tích theo độ dài prompt/output và model; không coi so sánh khác họ kiến trúc là scaling thuần theo số tham số |
+| Chất lượng được duy trì trong benchmark | Báo pass@1 cùng số bài đạt, token mismatch và chênh lệch với baseline; điều tra chênh lệch thay vì chỉ nhìn speedup |
 
-# Server: cập nhật main và ref contribution, dùng môi trường đã cài
-cd /data/SWIFTEXPER
-git switch main
-git pull --ff-only origin main
-git fetch origin AdaptiveCache:refs/remotes/origin/AdaptiveCache
-source .venv/bin/activate
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_h100.sh
-```
+Phải phân biệt sửa lỗi kỹ thuật (LRU, reset mask, state nhất quán), quyết định thiết kế phương pháp (reuse incumbent, threshold/capacity, miss/hit policy) và contribution khoa học đã có bằng chứng. Retrieval theo representation đã có trong KNN-SSD; không tuyên bố chỉ riêng cosine + cache là mới. Việc tối ưu cấu hình theo chi phí cũng cần đối chiếu KnapSpec. Novelty của nghiên cứu này chưa được xác nhận.
 
-### 2026-10-19T17:29:50+00:00
+Các rủi ro diễn giải hiện tại: cấu hình tối ưu sớm có thể chi phối toàn stream; thứ tự bài ảnh hưởng cache và SWIFT; không warm-up khiến phần khởi đầu có trọng số trong kết quả; sửa eager backend/termination/instrumentation có thể thay baseline latency. Những hạn chế này phải được công bố, không dùng nhãn protocol metric để che khác biệt runtime.
 
-Bắt đầu run `C:\Users\Admin\SWIFTEXPER\runs\source_review_20261020`. Chuẩn bị source từ `main` và `origin/AdaptiveCache`; repository gốc không bị sửa.
+## 7. Truy nguyên kết quả và trạng thái bằng chứng
 
-### 2026-10-19T17:29:50+00:00
+Mỗi run dưới `_local/runs/` giữ original source ZIP, commit nguồn, bản thực thi, `SOURCE_CHANGES.patch`, driver/assets, run config, manifest, model revision nếu có và phiên bản môi trường. JSONL lưu ID, input/output token IDs, thời gian và cache/source metadata. `results.csv` là bảng tổng hợp; file pass1/results chứa functional correctness từng bài. `execution.log` và log từng lệnh dùng điều tra lỗi, không phải nội dung tự động thêm vào tài liệu này.
 
-Run `C:\Users\Admin\SWIFTEXPER\runs\source_review_20261020` thất bại tại prepare sources: 'charmap' codec can't encode character '\u1eaf' in position 1: character maps to <undefined>. Giữ nguyên artifact và log; không coi là run đầy đủ.
+Đã kiểm tra logic tổng hợp metric bằng dữ liệu tổng hợp và đối chiếu hàm speed gốc; đã kiểm tra cú pháp và xuất source. Đã xác minh tiến trình của cả run chuẩn bị thành công/thất bại và lệnh tính lại metric được ghi vào execution.log, không sửa tài liệu này. Những kiểm tra đó không phải thực nghiệm model. **Chưa có kết quả H100, pass@1 hoặc speedup thực tế được cung cấp trong phiên làm việc này.** Khi có dữ liệu, chỉ cập nhật các kết luận có liên kết tới run/artifact và ghi rõ cấu hình, số lần lặp, độ biến thiên và các sai khác protocol.
 
-### 2026-10-19T17:30:01+00:00
-
-Bắt đầu run `C:\Users\Admin\SWIFTEXPER\runs\source_review_20261020_v2`. Chuẩn bị source từ `main` và `origin/AdaptiveCache`; repository gốc không bị sửa.
-
-### 2026-10-19T17:30:01+00:00
-
-Đã chuẩn bị source và lưu original ZIP, SOURCE_CHANGES.patch, metadata cấu hình. SWIFT `a0b0256f42de24e6ce052d350fcb7905ee8f68d6`, AdaptiveCache `bed868364a43aec122154b865735878b4230fc75`. Không chạy smoke test hoặc warm-up.
-
-### 2026-10-19T17:30:01+00:00
-
-Run `C:\Users\Admin\SWIFTEXPER\runs\source_review_20261020_v2` chỉ chuẩn bị source; chưa chạy GPU, chưa có điểm.
-
-### 2026-10-19T17:31:32+00:00
-
-Bắt đầu run `C:\Users\Admin\SWIFTEXPER\runs\source_review_final_20261020`. Chuẩn bị source từ `main` và `origin/AdaptiveCache`; repository gốc không bị sửa.
-
-### 2026-10-19T17:31:33+00:00
-
-Đã chuẩn bị source và lưu original ZIP, SOURCE_CHANGES.patch, metadata cấu hình. SWIFT `a0b0256f42de24e6ce052d350fcb7905ee8f68d6`, AdaptiveCache `bed868364a43aec122154b865735878b4230fc75`. Không chạy smoke test hoặc warm-up.
-
-### 2026-10-19T17:31:33+00:00
-
-Run `C:\Users\Admin\SWIFTEXPER\runs\source_review_final_20261020` chỉ chuẩn bị source; chưa chạy GPU, chưa có điểm.
-
-## 2026-10-20 — Sắp xếp repository để bàn giao
-
-Theo yêu cầu gom phần không đưa lên Git vào một folder, đã tạo `_local/` và di chuyển (không xóa dữ liệu): `Paper/` sang `_local/papers/`, `research/` sang `_local/archive/research/`, `runs/` sang `_local/runs/`, `desktop.ini` sang `_local/system/`. Bytecode ở source/scripts được gom vào `_local/archive/bytecode/`. Các local clone cũ chỉ còn là bản lưu, không dùng làm entrypoint hoặc source chạy chính. Đường dẫn tuyệt đối bên trong metadata của run local cũ giữ nguyên giá trị lịch sử, không phải đường dẫn dùng cho run mới.
-
-Đã viết lại `Readme.md` thành trang giới thiệu project, phân biệt upstream và contribution, sơ đồ thư mục, một lệnh chạy H100, cấu hình benchmark, cách đọc pass@1/results.csv và attribution/citation. Chỉ một file nhật ký công việc vẫn là file này; README là tài liệu sử dụng repo, không phải một báo cáo việc làm khác.
-
-Runner mặc định ghi vào `_local/runs/h100_<timestamp>/`; launcher chuyển bytecode mới vào `_local/python_cache/` bằng PYTHONPYCACHEPREFIX, tương thích Python 3.9. `.gitignore` bỏ qua toàn bộ `_local/`, thêm guard cho output legacy và desktop.ini. Vì 6 file `.pyc` đã bị commit trong repo gốc, việc di chuyển chúng thể hiện thành 6 deletion trong Git; cần đưa các deletion này vào commit dọn repo. Không đổi `.py` của thuật toán SWIFT gốc, requirements, eval_llama.sh, skip_layers.json hoặc LICENSE.
-
-Lệnh PowerShell script dọn ban đầu bị execution policy máy local chặn trước khi di chuyển; đã thực hiện bằng các cmdlet native trong phiên PowerShell hiện hành, không thay đổi execution policy. Mọi source/destination được kiểm tra nằm trong workspace và `_local/` trước khi Move-Item; không overwrite thư mục đã tồn tại.
-
-### Commit và chạy sau khi sắp xếp
-
-```bash
-# Local: stage đúng tài liệu, bộ chạy và việc bỏ bytecode đã tracked
-git add -- .gitignore Readme.md EXPERIMENT_LOG.md scripts
-git add -u -- evaluation_llama/__pycache__ model/swift/__pycache__
-git diff --cached --stat
-git commit -m "Organize experiment tooling and add automatic HumanEval scoring"
-git push origin main
-
-# Server
-cd /data/SWIFTEXPER
-git switch main
-git pull --ff-only origin main
-git fetch origin AdaptiveCache:refs/remotes/origin/AdaptiveCache
-source .venv/bin/activate
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_h100.sh
-```
-
-Không cần copy hoặc push `_local/`; script tự tạo thư mục output khi chạy. Model vẫn gọi bằng Hugging Face ID. Chưa commit/push thay người dùng và chưa có kết quả inference H100.
-
-Xác minh sau sắp xếp: `git check-ignore` xác nhận papers/archive/runs bên trong `_local/` đều bị bỏ qua; diff của các file `.py` upstream và các cấu hình gốc vẫn rỗng; Bash syntax và Python 3.9 syntax của 8 file Python trong `scripts/` đều hợp lệ. Các kiểm tra này không chạy inference hoặc evaluator.
-
-## 2026-10-20 — Đưa implementation về đúng nhánh AdaptiveCache
-
-Theo xác nhận của người dùng, đã tạo local branch `AdaptiveCache` từ `origin/AdaptiveCache` và worktree ở `_local/worktrees/AdaptiveCache`, không checkout đè lên main đang có thay đổi. Git cần quyền ghi metadata `.git`; sandbox ban đầu chặn tạo ref, sau đó đã được cấp phép cho thao tác worktree và commit local. Không sửa quyền sandbox hoặc push remote.
-
-Commit local **`fec8d32` — Fix AdaptiveCache retrieval and stream state lifecycle** chỉ chứa hai file contribution: `evaluation_llama/adaptive_cache.py` và `evaluation_llama/inference_swift.py`. Lớp cache sửa LRU/empty miss/embedding mask; forward wrapper giữ incumbent trên miss, tạm dùng cấu hình hit rồi khôi phục state bằng finally. Cache khởi tạo trước vòng chạy; clear bỏ qua load file cũ. Có provenance của entry và thời gian embedding/search/update. Decoder bên trong branch giữ nguyên body của SWIFT main, chỉ đổi tên `_swift_forward_impl`; kiểm tra AST xác nhận điều này trước khi commit. Sửa token/EOS và xuất HumanEval vẫn do phần chuẩn hóa chung ở runner áp dụng tương đương cho hai bên.
-
-Đã bỏ `scripts/assets/adaptive_cache.py` và `adaptive_forward.txt`. `source_patches.py` nay đọc chính decoder từ branch contribution, không dựng implementation AdaptiveCache mới từ main. File cache của branch được giữ nguyên khi xuất run. Runner từ chối ref contribution cũ và hướng dẫn push/fetch branch mới. Nhánh remote `origin/AdaptiveCache` tại máy local chưa cập nhật vì chưa push; chuẩn bị source local dùng `--adaptive-ref AdaptiveCache`.
-
-### Đưa cả hai nhánh lên server
-
-```bash
-# Từ checkout main: commit bộ chạy/tài liệu và việc bỏ bytecode nếu chưa commit
-git add -- .gitignore Readme.md EXPERIMENT_LOG.md scripts
-git add -u -- evaluation_llama/__pycache__ model/swift/__pycache__
-git commit -m "Use branch-owned AdaptiveCache with shared H100 evaluation"
-git push origin main AdaptiveCache
-
-# Server
-cd /data/SWIFTEXPER
-git switch main
-git pull --ff-only origin main
-git fetch origin AdaptiveCache:refs/remotes/origin/AdaptiveCache
-source .venv/bin/activate
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_h100.sh
-```
-
-Commit contribution đã lưu local; bộ chạy trên main vẫn chưa commit. Không cần stage thư mục worktree: Git push branch sẽ gửi code đã commit dù worktree nằm trong `_local/` bị ignore. Chưa có kết quả H100 hoặc pass@1 thực tế.
-
-Đã xuất source với `--prepare-only --adaptive-ref AdaptiveCache` tại `_local/runs/branch_owned_source_review_20261020`. Hai commit được lấy đúng là main `a0b0256` và contribution `fec8d32`. File cache được runner giữ byte-for-byte như trong Git archive; nội dung cũng khớp `git show` sau chuẩn hóa CRLF/LF (archive trên máy Windows dùng CRLF, Git blob dùng LF). Worktree AdaptiveCache sạch sau commit; source `.py` upstream main không đổi. Đây chỉ là xác minh source/cú pháp, không có inference hoặc số điểm giả lập.
-
-### 2026-10-19T17:44:56+00:00
-
-Bắt đầu run `C:\Users\Admin\SWIFTEXPER\_local\runs\branch_owned_source_review_20261020`. Chuẩn bị source từ `main` và `AdaptiveCache`; repository gốc không bị sửa.
-
-### 2026-10-19T17:44:57+00:00
-
-Đã chuẩn bị source và lưu original ZIP, SOURCE_CHANGES.patch, metadata cấu hình. SWIFT `a0b0256f42de24e6ce052d350fcb7905ee8f68d6`, AdaptiveCache `fec8d32dd805314a185ad245db40ca1c9dd31bb7`. Không chạy smoke test hoặc warm-up.
-
-### 2026-10-19T17:44:57+00:00
-
-Run `C:\Users\Admin\SWIFTEXPER\_local\runs\branch_owned_source_review_20261020` chỉ chuẩn bị source; chưa chạy GPU, chưa có điểm.
-
-## Công bố bộ chạy lên GitHub theo yêu cầu người dùng
-
-Người dùng đã yêu cầu thực thi commit/push cả hai nhánh. Đã kiểm tra remote: `main` đang ở `a0b0256`, `AdaptiveCache` ở `bed8683`, phù hợp ancestry của các thay đổi local; không cần force push. Source `.py` SWIFT gốc và các cấu hình upstream không đổi. Bộ chạy gồm 7 file Python có syntax Python 3.9 hợp lệ, shell launcher có Bash syntax hợp lệ. `_local/` không được stage; chỉ đưa tài liệu, ignore rules, scripts và việc bỏ 6 bytecode đã tracked lên main. Contribution đã nằm trong commit `fec8d32` trên AdaptiveCache.
-
-Git trong sandbox không đọc được credentials Windows; kiểm tra remote đã thực hiện ngoài sandbox với quyền được cấp. Không thay đổi credential, remote URL hoặc lịch sử Git. Kết quả commit/push và xác minh remote sẽ được ghi nối tiếp sau khi lệnh hoàn thành. Chưa chạy thực nghiệm H100 ở bước công bố source này.
-
-### Đã push thành công
-
-Đã tạo commit main `bb07794` — Add organized H100 experiments with automatic HumanEval pass@1 — và push atomic cùng contribution `fec8d32` lên `https://github.com/pitorr05/SWIFTEXPER`. GitHub đã nhận cả hai nhánh; `git ls-remote --heads origin main AdaptiveCache` xác nhận đúng hai commit sau push. Không có force push; `_local/` và dữ liệu local không nằm trong commit. Mục xác nhận này được lưu bằng commit tài liệu tiếp theo trên main.
-
-Lệnh trên server để lấy cả hai nhánh và chạy (model tự tải qua Hugging Face ID):
-
-```bash
-cd /data/SWIFTEXPER
-git switch main
-git pull --ff-only origin main
-git fetch origin AdaptiveCache:refs/remotes/origin/AdaptiveCache
-source .venv/bin/activate
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_h100.sh
-```
-
-Chỉ hoàn thành công bố source; chưa chạy job trên server H100 hoặc báo điểm pass@1. Output thực tế sẽ nằm trong `_local/runs/` và được ghi tiếp vào nhật ký khi script chạy trên server.
-
-## Khôi phục chỉ số tốc độ chính theo code tác giả SWIFT
-
-Đã đọc lại §5.1/Appendix B.3 và đối chiếu `evaluation_llama/speed.py` chính thức. Paper nêu decoding speed và wall-time speedup nhưng phần metric không ghi rõ phép tổng hợp tốc độ qua các bài; code công khai của tác giả tính `mean(tokens_i / time_i)` và tỷ số hai trung bình. Việc phiên bản runner trước dùng `sum(tokens_i) / sum(time_i)` làm chỉ số chính là thay đổi protocol không phù hợp mục tiêu đối chiếu SWIFT. Đây là sửa metric; không khẳng định mọi paper dùng chung một phép tổng hợp.
-
-Đã cập nhật aggregation, summary JSON, comparison JSON, bảng CSV, run config và metadata inference sang `metric_protocol: swift_author_code_v1`. `tokens_per_second` là trung bình tokens/s từng bài; `speedup_vs_baseline`/`speedup_vs_swift` là tỷ số hai trung bình. Không dùng trung bình các speedup từng bài. Throughput tổng chỉ còn ở `global_tokens_per_second` và `global_throughput_speedup_vs_*`; tỷ số tổng thời gian nằm ở `inference_time_speedup_vs_*`. Công cụ phân tích sử dụng cùng helper để không lệch công thức giữa runner và xử lý riêng.
-
-Thêm `scripts/summarize_results.py` để tính lại số liệu từ JSONL của run đã hoàn tất, tái sử dụng điểm HumanEval đã có, không chạy GPU hoặc evaluator. Công cụ ghi `results.swift_author_code_v1.csv` và `metrics.swift_author_code_v1.json`, không ghi đè CSV/JSONL/metadata/summary/pass@1 cũ; ghi protocol nguồn là legacy nếu run cũ chưa có marker. Cần đủ output và điểm cũ hợp lệ, hoặc công cụ báo lỗi rõ. File versioned đã tồn tại thì chọn output-dir khác.
-
-```bash
-python scripts/summarize_results.py --run-dir _local/runs/h100_<timestamp>
-```
-
-Lần sửa này không đổi thuật toán, nhánh contribution, generation parameters hoặc HumanEval evaluator. Các chỉnh sửa runtime đã công bố trước đó vẫn tồn tại, nên việc đổi metric không biến implementation đang đo thành bản upstream nguyên trạng. Công thức tham chiếu: https://github.com/hemingkx/SWIFT/blob/main/evaluation_llama/speed.py .
-
-### Xác minh metric
-
-Đã chạy kiểm tra số học local trong `_local/verification/check_swift_metrics.py` (không đưa lên Git). Fixture có token/time khác nhau giữa bài để phân biệt ba phép tính: công thức tác giả cho speedup 1.5, throughput tổng cho 4/3, còn trung bình speedup từng bài cho 1.625. Kết quả primary của helper mới khớp trực tiếp hàm `speed()` trong file gốc không chỉnh sửa. Đây là số học dữ liệu tổng hợp, không phải kết quả model.
-
-Đã xác minh quy trình tính lại trên fixture tổng hợp đủ 1.000 CNN/DM và 164 HumanEval mỗi phương pháp: xuất đúng 6 dòng CSV có protocol, đồng nhất với row builder của runner, giữ byte của CSV/summary/JSONL/pass@1 cũ, từ chối ghi đè file versioned đã có. Kiểm tra còn bao gồm input thời gian không hợp lệ và không dùng aggregate thiếu version marker. Không chạy inference, không gọi HumanEval evaluator, không sinh điểm khoa học mới.
-
-Đã kiểm tra syntax Python 3.9 cho 8 file Python trong scripts và Bash syntax của launcher; không đổi requirements. Bộ sửa sẽ được commit/push trên main để server pull; AdaptiveCache vẫn ở commit `fec8d32`, không có thay đổi của lần sửa metric này.
+Tài liệu tham chiếu: [paper SWIFT](https://proceedings.iclr.cc/paper_files/paper/2025/file/d74d002a9154b4cc433a234feb27c5f4-Paper-Conference.pdf), [speed.py tác giả](https://github.com/hemingkx/SWIFT/blob/main/evaluation_llama/speed.py), [HumanEval](https://github.com/openai/human-eval), [KNN-SSD](https://arxiv.org/abs/2505.16162), [KnapSpec](https://arxiv.org/abs/2602.20217). Hướng dẫn chạy và bố cục repo nằm trong `Readme.md`.

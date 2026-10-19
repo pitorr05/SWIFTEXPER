@@ -21,11 +21,16 @@ sys.path.insert(0, str(SCRIPTS / 'assets'))
 from research_utils import METRIC_PROTOCOL, aggregate, compare_aggregates, read_records, validate_pair, write_json
 from source_patches import prepare
 
+EXECUTION_LOG = None
 
-def note(message):
+
+def note(message, log_path=None):
+    """Operational progress belongs to run artifacts, not the research design document."""
     stamp = datetime.now(timezone.utc).isoformat(timespec='seconds')
-    with open(REPO / 'EXPERIMENT_LOG.md', 'a', encoding='utf-8') as stream:
-        stream.write(f'\n### {stamp}\n\n{message}\n')
+    target = Path(log_path) if log_path is not None else EXECUTION_LOG
+    if target is not None:
+        with open(target, 'a', encoding='utf-8') as stream:
+            stream.write(f'[{stamp}] {message}\n')
     print(message, flush=True)
 
 
@@ -72,7 +77,7 @@ def save_changes(folder, original):
 
 
 def run(command, cwd, logfile):
-    print(f'RUN {shlex.join(map(str, command))}\nLOG {logfile}', flush=True)
+    note(f'RUN {shlex.join(map(str, command))}\nLOG {logfile}')
     with open(logfile, 'x', encoding='utf-8') as stream:
         try:
             subprocess.run(list(map(str, command)), cwd=cwd, stdout=stream,
@@ -98,8 +103,8 @@ def check_environment(output):
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise RuntimeError('Exactly one CUDA GPU must be visible; set CUDA_VISIBLE_DEVICES=0')
     if packages['transformers'] != '4.37.1':
-        print('NOTE: original SWIFT pins transformers==4.37.1; active version is '
-              + packages['transformers'] + '. No packages were changed.', flush=True)
+        note('NOTE: original SWIFT pins transformers==4.37.1; active version is '
+             + packages['transformers'] + '. No packages were changed.')
     run(['nvidia-smi'], REPO, output / 'nvidia-smi.log')
 
 
@@ -134,7 +139,7 @@ def compare_task(folder, task, expected, write_comparison=True):
             **compare_aggregates(summaries[method], summaries[base]),
             'token_mismatch_task_ids': mismatches, 'token_mismatch_count': len(mismatches)}
         if mismatches:
-            print(f'NOTE: {task}/{method} vs {base}: {len(mismatches)} token mismatches; retained for analysis.', flush=True)
+            note(f'NOTE: {task}/{method} vs {base}: {len(mismatches)} token mismatches; retained for analysis.')
     if write_comparison:
         write_json(folder / f'{task}.comparisons.json', comparisons)
     return summaries, comparisons
@@ -238,6 +243,7 @@ def execute(args, output, reference, adaptive):
 
 
 def main():
+    global EXECUTION_LOG
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
         sys.stderr.reconfigure(encoding='utf-8', errors='replace')
@@ -263,6 +269,7 @@ def main():
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
     output = (args.output_dir or REPO / '_local' / 'runs' / f'h100_{stamp}').resolve()
     output.mkdir(parents=True, exist_ok=False)
+    EXECUTION_LOG = output / 'execution.log'
     stage = 'prepare sources'
     try:
         note(f'Bắt đầu run `{output}`. Chuẩn bị source từ `{args.swift_ref}` và `{args.adaptive_ref}`; repository gốc không bị sửa.')
