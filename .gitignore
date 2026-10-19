@@ -1,0 +1,10 @@
+# All local papers, archived workspaces, caches, and experiment artifacts.
+/_local/
+# Compatibility with outputs produced by earlier versions or manual upstream runs.
+/runs/
+/research/
+/outputs/
+/test/
+desktop.ini
+__pycache__/
+*.pyc
