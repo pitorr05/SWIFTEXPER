@@ -320,7 +320,7 @@ def main():
         shutil.copytree(SCRIPTS, bundle, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
         config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
         config.update(output_dir=str(output), sources=origins, warmup=False, metric_protocol=METRIC_PROTOCOL,
-                      human_eval_completion_policy='raw, no stripping or repair')
+                      human_eval_completion_policy='prompt_context_decode_v1; no stripping or code repair')
         write_json(output / 'run_config.json', config)
         note('Sources prepared; original ZIP, SOURCE_CHANGES.patch and configuration saved. '
              f'SWIFT {origins["swift"]["commit"]}, AdaptiveCache {origins["adaptive"]["commit"]}. No smoke test or warm-up.')

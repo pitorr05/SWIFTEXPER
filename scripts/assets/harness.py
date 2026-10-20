@@ -12,6 +12,7 @@ from tqdm import tqdm
 from evaluation_llama.research_utils import METRIC_PROTOCOL, aggregate, digest, validate_output_path, write_json
 from evaluation_llama.phase_timer import finish_request
 from evaluation_llama.gsm8k import PROTOCOL as GSM8K_PROTOCOL, load_gsm8k
+from evaluation_llama.completion_decode import POLICY as DECODE_POLICY, decode_continuation
 
 
 def seed_everything(seed=2024):
@@ -157,7 +158,11 @@ def run_eval(model, tokenizer, forward_func, model_id, answer_file, max_new_toke
             eos = tokenizer.eos_token_id
             if eos in tokens and tokens.index(eos) != len(tokens)-1:
                 raise RuntimeError('Forward returned tokens after EOS')
-            text = tokenizer.decode(tokens, skip_special_tokens=True, spaces_between_special_tokens=False)
+            if task_name == 'humaneval':
+                text = decode_continuation(tokenizer, ids[0].tolist(), tokens,
+                                           expected_prompt=question['prompt'])
+            else:
+                text = tokenizer.decode(tokens, skip_special_tokens=True, spaces_between_special_tokens=False)
             accepted = sum(max(0, int(n)-1) for n in lengths)
             choice = {'turns': text, 'decoding_steps': [int(step)], 'new_tokens': [len(tokens)],
                       'wall_time': [elapsed], 'accept_lengths': list(map(int, lengths)),
@@ -167,6 +172,8 @@ def run_eval(model, tokenizer, forward_func, model_id, answer_file, max_new_toke
             row = {'schema_version': 1, 'task_name': task_name, 'task_id': task_id, 'model_id': model_id,
                    'input_token_ids': inputs, 'input_sha256': digest(inputs), 'output_token_ids': tokens,
                    'choices': [choice], 'forward_metrics': metrics, 'tstamp': time.time()}
+            if task_name == 'humaneval':
+                row['completion_policy'] = DECODE_POLICY
             if task_name == 'gsm8k':
                 row.update(reference_answer=question['answer'], gsm8k_protocol=GSM8K_PROTOCOL,
                            hit_token_limit=len(tokens) == max_new_tokens,

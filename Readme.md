@@ -93,6 +93,18 @@ Both GSM8K profiles use the same seeded 1,000 test questions and five train demo
 
 ## Results and reproducibility
 
+### Re-score saved HumanEval tokens without GPU inference
+
+```bash
+python scripts/recheck_humaneval.py --run-dir \
+  _local/runs/h100_20261019T183923223276Z \
+  _local/runs/h100_20261019T205721904342Z
+```
+
+This loads only the cached tokenizer at the recorded model revision, reconstructs completions in prompt context, and evaluates all three methods for every recorded seed. Use the original environment/Transformers version. Add `--allow-download` only if tokenizer files are missing from the local cache; model weights are never loaded. Add `--diagnose-only` to decode and check syntax without running generated tests.
+
+Each run receives a new `humaneval_context_<timestamp>/` containing samples, per-task diagnostics, evaluator results, scores and a comparison `results.csv`. Original JSONL, scores, timing and the original run's CSV are unchanged. The recheck CSV contains quality results only; pair it with the original speed results and explicitly identify the completion policy. Decoding changes do not guarantee a score increase. No indentation repair, cropping or answer selection is performed. New inference runs use the same `prompt_context_decode_v1` policy for HumanEval only; output token IDs and decoder algorithms are unchanged.
+
 Each run creates `_local/runs/h100_<UTC timestamp>/`. Read `results.csv` for decoding speed, speedups, acceptance metrics, token mismatches, and HumanEval pass@1. Per-task code correctness is in `seed_2024/humaneval.<method>.samples.jsonl_results.jsonl`; aggregate scores are in `humaneval.<method>.pass1.json`. Commands, downloads, inference progress, optimization and evaluator output stream directly to the terminal with unbuffered Python output. The launcher creates no text log files and does not append operational messages to `EXPERIMENT_LOG.md`.
 
 ### Speed metric protocol
