@@ -93,6 +93,38 @@ Both GSM8K profiles use the same seeded 1,000 test questions and five train demo
 
 ## Results and reproducibility
 
+### Research branch: controlled mask-search ablations
+
+On `research/swift-mask-search`, the three new source files are `model/mask_search.py` (selection and isolated replay), `scripts/run_mask_search.py` (snapshots, data splits, metrics), and `scripts/run_mask_search.sh` (launcher). Existing inference/model files and the original H100 launcher stay unchanged. `knapspec/` is not imported or copied into this experiment.
+
+```bash
+# First diagnostic: 16 train questions, 7B, all nine methods sequentially.
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh \
+  --stage diagnose --models meta-llama/Llama-2-7b-hf \
+  --tasks gsm8k --gsm8k-profiles paper64
+
+# Larger development diagnostic on both model sizes; no test-set tuning.
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh --stage diagnose --data-num 128
+
+# Full evaluation only after selecting the protocol on development data.
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh \
+  --stage evaluate --seeds 2024 2025 2026
+```
+
+Default methods: AR, original SWIFT, `match_uniform`, `cost_uniform`, `match_halving`, `cost_halving`, `cost_halving_refresh`, AdaptiveCache and `fixed_first` (freeze the native SWIFT mask after request one, no embedding). `--methods` can select fewer, but must include `baseline swift`. Default models are LLaMA-2-7B/13B; default tasks are CNN/DM and both GSM8K budgets. HumanEval is opt-in with `--stage evaluate --tasks humaneval`; pair `--models` with `--code-models` when overriding sizes. Only one GPU and one inference subprocess run at a time. No installation, warm-up or GPU smoke test is performed.
+
+Development uses train splits, excludes the one CNN/DM demonstration and five GSM8K demonstrations, and never uses HumanEval for tuning. Evaluation uses the existing test protocol. Each process starts fresh; method order rotates across seeds. Each run creates a new `_local/runs/mask_search_<timestamp>/` with original Git archives, executed source diffs, driver copies and hashes. Source edits are applied only inside those snapshots. Use `--prepare-only` to inspect them without inference.
+
+**Controlled comparisons:** all five research policies use an incumbent plus seven unique seeded random masks from SWIFT's layer-skipping search space, keeping the first/last layers. They use a local RNG, not generation RNG. Unlike original SWIFT, this controlled proposal pool does not use Bayesian optimization; only objective/allocation/window change among the five policies. Incumbents can diverge after different selections, so only the random proposals and proposal seeds are paired, not the entire evolving pool. Candidate/profile order is randomized reproducibly.
+
+Each race uses 192 replay input tokens: uniform = `8*(23+1)`; halving = `8*(7+1)+4*(15+1)+2*(31+1)`. Eight one-token draft profiles plus one six-token dense verification profile make **206 candidate-input units** per race. Default per-request budget 824 permits at most four races, separated by at least 32 committed tokens. This matches evaluated token units, not forward-call counts or GPU time; all actual profiling/copying/synchronization/selection costs remain inside inference timing. `--search-time-budget-ms` is an additional soft limit checked between races; an in-progress race is not interrupted. No early stop from a high in-window score is used in these research policies.
+
+The cost objective is an explicitly approximate linear prefix-yield/latency proxy with horizon 5, inspired by cost-aware selection in KnapSpec. It is not measured SWIFT tree M or tree throughput. All policies pay the same profiling probes, including match-only variants. Fixed-window variants replay the first generated context; refresh uses the latest verified window with correctly cropped scratch target KV. No model weights, target acceptance rules or committed tokens are modified.
+
+`diagnose` additionally pays for independent linear draft/full-target-verification probes of eight masks on the first race of the first four requests per process. These use private KV and never commit probe outputs. **Diagnostic speedups are not benchmark claims.** Per-method `*.diagnostics.csv` pairs proxy scores with linear probes and later observed tree M. Partial scores for halving losers have fewer evaluated labels, recorded explicitly. JSONL `forward_metrics.search_events` contains masks, context offsets, resource counts and post-selection observations. Those are research artifacts, not terminal text logs.
+
+`results.csv` reports actual tree M/alpha, macro/global speeds, latency ratios, request p50/p95, mismatches, cache/embedding costs, candidate-token units, search wall time and diagnostic time; GSM8K also includes accuracy/missing/cap/paired correctness. Search/diagnostic time overlaps optimization wall time and must not be added twice. The post-selection host-time proxy subtracts search wall time; synchronized request wall time remains the authoritative end-to-end measurement. No speedup or novelty has been established by implementation or CPU checks alone.
+
 ### Re-score saved HumanEval tokens without GPU inference
 
 ```bash
