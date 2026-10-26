@@ -17,7 +17,7 @@ import zipfile
 
 SCRIPTS = Path(__file__).resolve().parent
 REPO = SCRIPTS.parent
-sys.path.insert(0, str(SCRIPTS / 'assets'))
+sys.path.insert(0, str(SCRIPTS / 'runtime'))
 from research_utils import METRIC_PROTOCOL, aggregate, compare_aggregates, read_records, validate_pair, write_json
 from source_patches import prepare
 from gsm8k import score_records, compare_scores
@@ -312,7 +312,7 @@ def main():
         origins = {'swift': export_source(args.swift_ref, reference, 'swift', snapshots),
                    'adaptive': export_source(args.adaptive_ref, adaptive, 'adaptive', snapshots)}
         before = {str(folder): code_sources(folder) for folder in (reference, adaptive)}
-        prepare(reference, adaptive, SCRIPTS / 'assets')
+        prepare(reference, adaptive, SCRIPTS / 'runtime')
         for folder in (reference, adaptive):
             save_changes(folder, before[str(folder)])
         # Preserve the exact orchestrator and patch assets used by this run.

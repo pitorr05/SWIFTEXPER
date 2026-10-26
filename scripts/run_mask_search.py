@@ -12,7 +12,7 @@ import sys
 
 SCRIPTS = Path(__file__).resolve().parent
 REPO = SCRIPTS.parent
-sys.path[:0] = [str(REPO), str(SCRIPTS / 'assets')]
+sys.path[:0] = [str(REPO), str(SCRIPTS / 'runtime')]
 from model.mask_search import POLICIES, PROTOCOL
 from run_experiments import (export_source, code_sources, save_changes, check_environment,
                              run, note, score_records, compare_scores)
@@ -140,7 +140,7 @@ def prepare_sources(args, output):
     sources = {'swift': export_source(args.swift_ref, swift, 'swift', snapshots),
                'adaptive': export_source(args.adaptive_ref, adaptive, 'adaptive', snapshots)}
     originals = {str(p): code_sources(p) for p in (swift, adaptive)}
-    prepare(swift, adaptive, SCRIPTS / 'assets')
+    prepare(swift, adaptive, SCRIPTS / 'runtime')
     for root in (swift, adaptive):
         patch_split(root)
         save_changes(root, originals[str(root)])

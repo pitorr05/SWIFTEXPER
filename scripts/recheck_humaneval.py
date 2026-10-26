@@ -10,7 +10,7 @@ import math
 from pathlib import Path
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / 'assets'))
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'runtime'))
 from completion_decode import POLICY, decode_continuation
 from research_utils import digest, read_records, validate_pair, write_json
 from evaluate_humaneval import score_samples

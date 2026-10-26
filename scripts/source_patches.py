@@ -101,7 +101,7 @@ def patch_swift(text, function_name='swift_forward'):
 def main():
     # Helpers are copied byte-for-byte; no import path can route reference through contribution code.
     for root in (REFERENCE, ADAPTIVE):
-        for source, name in (('harness.py', 'eval.py'), ('speed.py', 'speed.py'), ('research_utils.py', 'research_utils.py'), ('phase_timer.py', 'phase_timer.py'), ('gsm8k.py', 'gsm8k.py'), ('completion_decode.py', 'completion_decode.py')):
+        for source, name in (('harness.py', 'eval.py'), ('speed_adapter.py', 'speed.py'), ('research_utils.py', 'research_utils.py'), ('phase_timer.py', 'phase_timer.py'), ('gsm8k.py', 'gsm8k.py'), ('completion_decode.py', 'completion_decode.py')):
             shutil.copyfile(ROOT / source, root / 'evaluation_llama' / name)
     baseline = patch_cli(original(REFERENCE, 'evaluation_llama/inference_baseline.py'), False)
     # Match the eager target attention backend used by the custom SWIFT model.
@@ -117,9 +117,9 @@ def main():
 
 
 
-def prepare(reference, adaptive, assets):
+def prepare(reference, adaptive, runtime):
     global ROOT, REFERENCE, ADAPTIVE, ORIGINALS
-    ROOT, REFERENCE, ADAPTIVE = assets, reference, adaptive
+    ROOT, REFERENCE, ADAPTIVE = runtime, reference, adaptive
     ORIGINALS = {}
     for folder in (reference, adaptive):
         for path in ('evaluation_llama/inference_baseline.py', 'evaluation_llama/inference_swift.py', 'model/swift/utils.py'):

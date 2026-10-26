@@ -8,7 +8,7 @@ import math
 from pathlib import Path
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / 'assets'))
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'runtime'))
 from research_utils import export_humaneval, read_records, write_json
 
 

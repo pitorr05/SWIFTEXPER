@@ -194,3 +194,13 @@ Utility là prefix-yield/latency proxy cho linear horizon 5, không phải M th�
 Chế độ diagnose dùng train, mặc định 16 mẫu, có thể tăng 128; loại exemplar CNN/DM và năm exemplar GSM8K khỏi câu hỏi. HumanEval bị chặn trong development. Diagnostic có trả thêm chi phí linear draft/full-target verify trên tám mask ở race đầu của bốn request đầu mỗi process, chỉ để kiểm tra ranking; số tốc độ ở diagnose không phải benchmark. Lưu diagnostics CSV cùng mask/offset/label count và segment tree M quan sát sau chọn; điểm loser của halving có độ sâu đánh giá thấp hơn được ghi rõ. Chế độ evaluate dùng test và không chạy counterfactual probes. Không tự chuyển diagnose sang evaluate hoặc tune trên test.
 
 Kiểm tra local đã qua với model giả trên CPU: mask xác định theo seed, giữ boundary layers, ngân sách 192/206, ranking match/cost, cả năm policy, scratch KV không làm đổi data/length target, rollback khi lỗi, rolling offset và reset request. Đã thực thi hàm SWIFT được sinh trong snapshot với decode stubs để kiểm tra hook, dừng đúng 64 token và telemetry sau chọn; kiểm tra loader train loại đủ demonstrations. Source preparation/compile Python 3.9 thành công cho cả hai refs. Đây không phải inference LLaMA hoặc benchmark H100; cần thực nghiệm server trước khi đánh giá hiệu quả/novelty.
+
+## 2026-10-26 — Dọn cấu trúc nhánh nghiên cứu
+
+Chỉ áp dụng trên research/swift-mask-search; không chỉnh nhánh main hoặc AdaptiveCache. Giữ nguyên thuật toán, CLI, metric và định dạng output. Giữ đường dẫn evaluation_llama/, model/swift/, launcher gốc và cấu hình layer.
+
+Đổi scripts/assets/ thành scripts/runtime/ để phân biệt Python hỗ trợ với hình paper trong assets/. Đổi adapter tốc độ thành speed_adapter.py; source_patches.py vẫn xuất dưới tên evaluation_llama/speed.py trong snapshot. Cập nhật import, nguồn copy và tài liệu của cả hai runner cùng công cụ HumanEval. Metric swift_author_code_v1 không thay đổi.
+
+Chuyển bản KnapSpec chưa tracked vào _local/references/knapspec/, kiểm tra hash toàn bộ file trước/sau. Không nhập code tham khảo vào phương pháp mới. Giữ nguyên EXPERIMENT_RESULTS.md, output cũ, papers và Git worktree. Readme có bản đồ chức năng và lệnh chạy ở đầu; hai entrypoint giữ nguyên đường dẫn.
+
+Kiểm tra đã qua: cú pháp Python 3.9 của script và source snapshot, shell bash -n, prepare-only cho cả hai runner, adapter được sao chép đúng byte, source thuật toán gốc không đổi và không sinh text log. Không tải model hoặc chạy GPU.
