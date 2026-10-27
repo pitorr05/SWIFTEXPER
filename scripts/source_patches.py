@@ -117,6 +117,29 @@ def main():
 
 
 
+def prepare_single(reference, assets):
+    """Common harness for AR/SWIFT only; no AdaptiveCache dependency."""
+    folder = reference / 'evaluation_llama'
+    for source, name in (('harness.py', 'eval.py'), ('speed.py', 'speed.py'),
+                         ('research_utils.py', 'research_utils.py'), ('phase_timer.py', 'phase_timer.py'),
+                         ('gsm8k.py', 'gsm8k.py'), ('completion_decode.py', 'completion_decode.py')):
+        shutil.copyfile(assets / source, folder / name)
+    baseline = patch_cli((folder / 'inference_baseline.py').read_text(encoding='utf-8'), False)
+    baseline = replace(baseline, '        revision=args.model_revision,',
+                       '        attn_implementation="eager",\n        revision=args.model_revision,')
+    swift = patch_swift((folder / 'inference_swift.py').read_text(encoding='utf-8'))
+    write(reference, 'evaluation_llama/inference_baseline.py', baseline)
+    write(reference, 'evaluation_llama/inference_swift.py', swift)
+    # Ragged paths use retrieve_indices=-1 for padding. Candidate ID zero is a
+    # real vocabulary token and can accidentally pass greedy verification.
+    # Use an impossible token ID for Cartesian padding; model inputs stay valid.
+    path = reference / 'model/swift/utils.py'
+    text = replace(path.read_text(encoding='utf-8'),
+                   'tree_candidates_ext = torch.cat([tree_candidates, torch.zeros((1), dtype=torch.long, device=tree_candidates.device)], dim=0)',
+                   'tree_candidates_ext = torch.cat([tree_candidates, torch.full((1,), -1, dtype=torch.long, device=tree_candidates.device)], dim=0)')
+    write(reference, 'model/swift/utils.py', text)
+
+
 def prepare(reference, adaptive, assets):
     global ROOT, REFERENCE, ADAPTIVE, ORIGINALS
     ROOT, REFERENCE, ADAPTIVE = assets, reference, adaptive

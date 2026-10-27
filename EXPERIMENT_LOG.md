@@ -178,3 +178,22 @@ Paired correctness GSM8K-7B không đổi so với AR (R/G=0/0). GSM8K-13B-64: S
 ### Công cụ chấm lại HumanEval từ token đã lưu
 
 Thêm `scripts/recheck_humaneval.py` chạy CPU/tokenizer và evaluator trên các run chỉ định. Policy `prompt_context_decode_v1` tái tạo continuation từ prompt+output token IDs, kiểm tra prompt và ranh giới trước khi chấm, không sửa code/indentation, không crop hoặc chọn đáp án theo kết quả test. Dùng revision và phiên bản Transformers được ghi nhận; mặc định chỉ đọc tokenizer cache. Công cụ lưu export, diagnostics, score và CSV mới dưới thư mục timestamp riêng, không thay raw JSONL, điểm cũ hoặc thời gian inference. `--diagnose-only` không thực thi tests. Future harness áp dụng cùng policy cho cả ba phương pháp HumanEval; thuật toán/token sinh không đổi. Đây là thay đổi representation/chấm điểm, không phải số đo inference mới; chưa có điểm chấm lại thực tế trên server để cập nhật báo cáo. Không bổ sung phần giải thích điểm pass@1 vào `BaoCao.tex`.
+
+
+## 2026-10-27 — SWIFT tree-control: implementation của hai cơ chế mục tiêu
+
+Nhánh research/swift-tree-control tạo từ main. Chỉ ba source entry mới: model/swift_tree_control.py, scripts/run_swift_tree.py và launcher .sh. Không nhập AdaptiveCache hay mask_search, không đổi layer-search native. prepare_single() xuất SWIFT/AR với harness chung mà không cần ref AdaptiveCache.
+
+Cơ chế 1 dùng rank label của greedy target trong top-10 draft (và ngoài top-10), chỉ trên parent prefix hợp lệ. Dirichlet smoothing và backoff cùng mask; minimum 32 nhãn, không học hậu tố sau sai khác đầu. DP max-plus chọn sibling widths trong at-most node budget; công thức reward dựa trên survival main spine và rank coverage, không bảo đảm xấp xỉ đó đúng với mọi workload.
+
+Cơ chế 2 là stopping/budget dùng finite lookahead (mặc định hai bước), transition bin từ draft quan sát và NNLS latency từ CUDA events của inference bình thường. Mô hình thiếu dữ liệu quay về native stopping; cập nhật model/timing nằm trong request wall time. Không gọi là confidence sequence hoặc Bellman tối ưu cho runtime thực. Cả hai contribution mới là mục tiêu nghiên cứu, chưa được xác nhận bằng benchmark.
+
+Bảy đối chứng mặc định gồm AR, SWIFT native, native_control (cùng cây với instrumentation/buffer cache), raw_dp, rank_dp, stop_only và joint. Fixed sweep là tùy chọn. So native_control giúp tách gain kỹ thuật; log nhãn raw/learned paired cùng learned-label/fallback counts để phát hiện controller chưa thực sự hoạt động.
+
+Phát hiện rủi ro padding: retrieve_indices=-1 lấy Cartesian dummy ID 0 trong code cũ; 0 là ID vocabulary hợp lệ nên có thể bị greedy chấp nhận. Snapshot mới dùng dummy -1 (không vào model) cho cả reference/controlled. Posterior/commit function không viết lại, source working SWIFT không sửa. Không coi metric protocol là tái lập runtime nguyên trạng paper.
+
+Diagnostic/train và evaluate/test riêng; loại demonstrations, HumanEval evaluation-only. Không có paid counterfactual target probes tự động; không dùng oracle từ dữ liệu hậu nghiệm để điều khiển output. CSV có speed protocol gốc, M/alpha, mismatches, chất lượng, latency, rank scoring và controller phases; timer host/GPU không cộng chồng lấp.
+
+Kiểm tra CPU với target giả đã qua: DP so exhaustive enumeration cả rank không concave; lookahead ưu tiên continue/stop khi đổi chi phí; estimator tách masks; sáu policy trên các hàm SWIFT snapshot thực; EOS, budget 1/2/64, root-only, optimization hook và KV commit. Pipeline CSV/GSM8K với bảy methods synthetic cũng qua. Prepare-only không tải model. Chưa chạy Llama thật/H100; không có speedup hoặc accuracy mới.
+
+Lookahead tái sử dụng frontier DP khi nối bước giả định, không dựng lại mọi đường ở mỗi lá. Telemetry tách GPU draft/KV copy/candidate/verify/posterior/commit; phase không instrument để trống, không giả thành 0. Có diagnostic-only --layer-search fixed để cô lập thay đổi lịch native optimizer khi số vòng verification khác nhau; evaluate vẫn bắt buộc native search. Các hàm posterior/commit/optimization và model/KV source đã đối chiếu AST/bytes với gốc; chỉ guard Cartesian padding và draft hooks được áp dụng trên snapshot.

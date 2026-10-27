@@ -1,3 +1,101 @@
+# SWIFTEXPER — SWIFT Tree Control
+
+Nhánh **research/swift-tree-control**: phát triển từ SWIFT, greedy trước, một H100. Runner mới **không chạy AdaptiveCache hoặc mask-search**. Hai cơ chế là prototype nghiên cứu; chưa có benchmark H100 hoặc bằng chứng vượt SOTA.
+
+## Chạy ở đâu, đọc code nào?
+
+| Mục đích | Đường dẫn |
+|---|---|
+| Chạy thí nghiệm mới | `scripts/run_swift_tree.sh` |
+| Estimator hạng target, DP và stopping | `model/swift_tree_control.py` |
+| Chuẩn bị source, chạy tuần tự, tổng hợp | `scripts/run_swift_tree.py` |
+| Native SWIFT được xuất từ Git | `--swift-ref main` (mặc định) |
+| Kết quả | `_local/runs/swift_tree_<timestamp>/results.csv` |
+| Phương pháp và quyết định kỹ thuật | `EXPERIMENT_LOG.md` |
+
+Giữ môi trường SWIFT Python 3.9 / Transformers 4.37.1 đang chạy được. Model ID được Hugging Face tải/cache; Llama-2 cần quyền truy cập sẵn. Không cài môi trường vLLM/KnapSpec vào môi trường này.
+
+```bash
+cd /data/SWIFTEXPER
+git fetch origin
+git switch research/swift-tree-control
+git pull --ff-only origin research/swift-tree-control
+source .venv/bin/activate
+
+# Diagnostic nhỏ để xem dữ liệu/policy; không phải warm-up tự động.
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_swift_tree.sh \
+  --stage diagnose --data-num 16 \
+  --models meta-llama/Llama-2-7b-hf \
+  --tasks gsm8k --gsm8k-profiles paper64
+
+# Diagnostic mặc định: 128 câu train, cả hai kích thước.
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_swift_tree.sh --stage diagnose
+
+# Test sau khi chốt protocol: 7B/13B, CNN/DM và GSM8K 64/512.
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_swift_tree.sh --stage evaluate --seeds 2024
+
+# HumanEval: 164 bài, CodeLlama theo cặp model.
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_swift_tree.sh \
+  --stage evaluate --tasks humaneval --seeds 2024
+
+# Fixed-depth/width sweep (bổ sung các cấu hình này vào bảy phương pháp mặc định).
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_swift_tree.sh \
+  --stage diagnose --data-num 16 --models meta-llama/Llama-2-7b-hf \
+  --tasks gsm8k --gsm8k-profiles paper64 \
+  --fixed-depths 2 4 8 --fixed-widths 1 3 5
+
+# Chỉ xuất snapshot; không tải model hoặc chạy GPU.
+python scripts/run_swift_tree.py --prepare-only
+```
+
+Một inference subprocess mỗi thời điểm; không chạy cài đặt/warm-up/smoke inference tự động. Terminal hiển thị trực tiếp, không tạo text runtime log. JSON/CSV và source provenance vẫn lưu. Mỗi lượt tạo thư mục mới, không resume/ghi đè.
+
+## Hai cơ chế và đối chứng
+
+**Ước lượng hạng target:** học từ logits verification đã có, chỉ tại parent mà main prefix còn khớp greedy target. Dừng lấy nhãn sau sai khác đầu; không gán ground truth cho hậu tố sai prefix. Phân phối có 11 nhóm: hạng 0–9 và ngoài top-10. Dirichlet prior đối xứng tổng mass 1; cần 32 nhãn để dùng bảng theo depth/confidence, nếu thiếu thì backoff pooled depth cùng mask; tiếp tục thiếu thì dùng raw draft probabilities. Confidence có 10 bin. Mask native thay đổi thì dùng bảng riêng. Đây là ước lượng online có smoothing, không phải confidence sequence hoặc bảo đảm calibration dưới drift.
+
+**DP và stopping:** max-plus DP phân bổ số sibling cho comb tree trong ngân sách node, tối ưu reward ước lượng (không mặc định lợi ích biên giảm dần). Bộ stopping dùng lookahead 1/2 bước, mặc định 2, phân phối chuyển bin quan sát từ draft và latency model học từ GPU events của inference bình thường. Không trả forward profiling phụ. Khi chưa đủ dữ liệu chi phí/chuyển trạng thái thì dùng stopping native. Latency fit là NNLS ridge 3 biến trên tối đa 256 lần verify, minimum 32; draft time lấy median gần đây. Không có bảo đảm Bellman tối ưu với mô hình học xấp xỉ.
+
+| ID | Cấu hình |
+|---|---|
+| `baseline` | AR target, harness chung |
+| `swift` | SWIFT native, không controller/timer/cache bổ sung |
+| `native_control` | Cùng cây/stopping native, thêm instrumentation và buffer memoization như các policy mới |
+| `raw_dp` | Phân bổ DP bằng raw probabilities, stopping native |
+| `rank_dp` | Phân bổ DP bằng estimator hạng, stopping native |
+| `stop_only` | Stopping/budget theo chi phí, scoring raw |
+| `joint` | Kết hợp estimator hạng và stopping/budget |
+| `fixed_d*_w*` | Đối chứng depth/width cố định khi chọn fixed sweep |
+
+Mặc định node cap 251 (root + 25×10), draft tối đa 25 như SWIFT. `raw_dp/rank_dp` dùng at-most ngân sách node của cây native trên cùng draft đã sinh; DP được phép bỏ node không có reward dự đoán. `stop_only/joint` chọn ngân sách trong cap. `native_control` giữ cây native, là đối chứng để tách tác động kỹ thuật. Node cap tùy chỉnh không sửa cây SWIFT/native_control.
+
+Cold-start là phần của lượt đo: native masks có thể thay đổi thường xuyên, nên rank model có thể dùng ít dữ liệu, hoặc controller chưa hoạt động ở diagnostic nhỏ. CSV ghi `learned_rank_labels`, `controlled_rounds`, `fallback_rounds`; không báo toàn bộ lượt chạy như thể luôn dùng policy mới.
+
+Số vòng verification khác nhau còn có thể làm khác lịch gọi native optimizer. Dùng `--layer-search fixed` trên **diagnose** để giữ initial mask và tách ảnh hưởng này; CSV ghi chế độ rõ. Evaluate bắt buộc native layer-search, không gọi fixed-mask control là tái lập paper SWIFT.
+
+## Đọc kết quả
+
+`results.csv` giữ metric `swift_author_code_v1`: mean sample Token/s và tỷ số hai trung bình. Có thêm global throughput, tổng thời gian, M/alpha, token mismatch, p50/p95, số node/depth, Brier/log-loss theo hạng và chi phí controller. GSM8K có accuracy, missing/cap, đúng→sai/sai→đúng; HumanEval tự chấm pass@1. CNN/DM chưa chấm ROUGE.
+
+GPU events đo riêng draft forward, draft KV copy, candidate mapping, verify, posterior và commit trong controlled policies. Không bao phủ toàn bộ CPU/tree building/optimization; các ô phase không được instrument ở AR/SWIFT gốc để trống. Host phase duration là thời gian enqueue, không đồng nhất GPU duration. Benchmark chính vẫn là synchronized request wall time bao gồm toàn bộ forward/controller; không cộng các timer chồng lấp. Round host rate dùng trong stopping chỉ là surrogate. Diagnostics CSV và JSONL tree events cho thấy dự báo trước update, nhãn rank, widths và fallback; Brier của raw và estimator trên cùng nhãn được lưu để so paired.
+
+Train diagnostic loại câu demonstration; HumanEval chỉ chạy test. State estimator/cost bắt đầu rỗng mỗi process, giữ xuyên request trong stream. Các seed xoay thứ tự method; chưa tự thay đổi thứ tự câu hỏi. Diagnostic hiện dùng telemetry của vòng sinh thật, **không có counterfactual target probes bổ sung**; không gọi kết quả chọn hậu nghiệm là oracle tốc độ. Chốt cấu hình trên train trước khi evaluate test.
+
+Shared snapshot corrections gồm harness/EOS/budget của runner cũ và một guard padding: Cartesian path pad dùng ID -1 thay ID 0 thật trong vocabulary, tránh pad vô tình được greedy chấp nhận. Không đưa ID -1 vào model. Guard áp dụng cho cả SWIFT reference và controlled snapshot, không sửa source gốc, posterior hoặc commit function. Vì vậy đây là protocol có ghi nhận corrections, không phải runtime upstream nguyên trạng.
+
+## Nguồn tham khảo và giới hạn
+
+- [SWIFT, ICLR 2025](https://github.com/hemingkx/SWIFT): code nền.
+- [SpecDec++, COLM 2025](https://github.com/Kaffaljidhmah2/SpecDec_pp): optimal stopping, tham khảo cách phát biểu; không nhập prediction head.
+- [Sequoia](https://github.com/Infini-AI-Lab/Sequoia): discrete tree optimization.
+- [CaDDTree](https://github.com/ZhangShuai1230/CaDDTree), [TAPS](https://arxiv.org/abs/2606.00487): đối chiếu tree budgeting và path-conditioned scoring.
+
+Các policy mới là adaptation trong SWIFT; runner chưa tái lập đầy đủ SpecDec++/Sequoia/CaDDTree/TAPS và chưa chạy bảng SOTA độc lập. Không suy ra novelty từ việc dùng DP/Bayes/Bellman. Sampling bị từ chối ở controlled CLI; giữ luật verification không đủ để khẳng định sampling đúng với policy mới.
+
+## Công cụ thực nghiệm trước đây
+
+Các hướng dẫn dưới đây dành cho runner AR/SWIFT/AdaptiveCache cũ; không phải entrypoint của nghiên cứu tree-control.
+
 # SWIFTEXPER
 
 Research experiments comparing **original SWIFT** and **AdaptiveCache**, with automatic CNN/DailyMail benchmarking and HumanEval pass@1 evaluation on a single H100.
