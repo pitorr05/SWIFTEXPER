@@ -29,7 +29,7 @@ FIELDS = ['metric_protocol', 'search_protocol', 'stage', 'split', 'seed', 'datas
           'candidate_input_tokens', 'mask_search_seconds', 'optimization_host_seconds',
           'diagnostic_probe_seconds', 'search_event_count', 'accuracy', 'correct',
           'missing_answer_rate', 'token_limit_rate', 'correct_to_wrong_vs_baseline',
-          'wrong_to_correct_vs_baseline', 'pass_at_1']
+          'wrong_to_correct_vs_baseline', 'pass_at_1', 'max_new_tokens']
 
 
 def write_text(path, text):
@@ -163,7 +163,9 @@ def configurations(args):
             if task == 'humaneval':
                 yield task, task, args.code_models[index], 164, 512, .95
             elif task == 'cnndm':
-                yield task, task, model, args.data_num, 64, .85
+                for limit in args.cnndm_max_new_tokens:
+                    key = task if limit == 64 else 'cnndm.quality512'
+                    yield key, task, model, args.data_num, limit, .85
             else:
                 for profile in args.gsm8k_profiles:
                     yield 'gsm8k.'+profile, task, model, args.data_num, {'paper64':64, 'quality512':512}[profile], .85
@@ -224,25 +226,27 @@ def summarize(folder, task, actual_task, model, count, seed, args):
             if m['config'][key] != metadata[0]['config'][key]:
                 raise ValueError(f'Different method configuration: {key}')
     rows = []
+    references = [m for m in ('baseline', 'swift') if m in records]
     gsm_scores = {m: score_records(records[m], count) for m in args.methods} if actual_task == 'gsm8k' else {}
     for method in args.methods:
-        for base in ('baseline', 'swift'):
+        for base in references:
             validate_pair(records[method], records[base])
         metrics = [r.get('forward_metrics', {}) for r in records[method]]
         write_diagnostics(folder,task,method,records[method])
         summary = summaries[method]
-        base_ratio = compare_aggregates(summary, summaries['baseline'])
-        swift_ratio = compare_aggregates(summary, summaries['swift'])
         row = {k: summary[k] for k in ('metric_protocol','samples','tokens','inference_seconds',
                'tokens_per_second','global_tokens_per_second','mean_accepted_length','acceptance_rate',
                'cache_hit_rate','embedding_seconds','optimization_host_seconds')}
         times = [sum(r['choices'][0]['wall_time']) for r in records[method]]
         row.update(search_protocol=PROTOCOL, stage=args.stage, split=args.split,
                    seed=seed, dataset=task, model=model, method=method,
-                   speedup_vs_baseline=base_ratio['speedup_ratio'], speedup_vs_swift=swift_ratio['speedup_ratio'],
-                   inference_time_speedup_vs_swift=swift_ratio['inference_time_speedup'],
+                   max_new_tokens=metadata[0]['config']['max_new_tokens'],
                    p50_request_seconds=percentile(times,.5), p95_request_seconds=percentile(times,.95))
-        for base in ('baseline', 'swift'):
+        for base in references:
+            ratio = compare_aggregates(summary, summaries[base])
+            row['speedup_vs_'+base] = ratio['speedup_ratio']
+            if base == 'swift':
+                row['inference_time_speedup_vs_swift'] = ratio['inference_time_speedup']
             row['token_mismatch_vs_'+base] = sum(a['output_token_ids'] != b['output_token_ids']
                                                 for a,b in zip(records[method], records[base]))
         for key in ('candidate_input_tokens','mask_search_seconds','diagnostic_probe_seconds'):
@@ -252,12 +256,16 @@ def summarize(folder, task, actual_task, model, count, seed, args):
             row['acceptance_rate'] = None
         if gsm_scores:
             score = gsm_scores[method]
-            paired = compare_scores(score, gsm_scores['baseline'])
-            write_json(folder / f'{task}.{method}.accuracy.json', dict(score, vs_baseline=paired))
+            paired = compare_scores(score, gsm_scores['baseline']) if 'baseline' in gsm_scores else None
+            score_output = dict(score)
+            if paired is not None:
+                score_output['vs_baseline'] = paired
+            write_json(folder / f'{task}.{method}.accuracy.json', score_output)
             row.update(accuracy=score['accuracy'],correct=score['correct'],
-                       missing_answer_rate=score['missing_answer_rate'],token_limit_rate=score['token_limit_rate'],
-                       correct_to_wrong_vs_baseline=len(paired['correct_to_wrong_ids']),
-                       wrong_to_correct_vs_baseline=len(paired['wrong_to_correct_ids']))
+                       missing_answer_rate=score['missing_answer_rate'],token_limit_rate=score['token_limit_rate'])
+            if paired is not None:
+                row.update(correct_to_wrong_vs_baseline=len(paired['correct_to_wrong_ids']),
+                           wrong_to_correct_vs_baseline=len(paired['wrong_to_correct_ids']))
         elif actual_task == 'humaneval':
             score_file = folder / f'{task}.{method}.pass1.json'
             run([sys.executable, SCRIPTS/'evaluate_humaneval.py', '--input', folder/f'{task}.{method}.jsonl',
@@ -283,6 +291,7 @@ def main():
     parser.add_argument('--code-models',nargs='+',default=['codellama/CodeLlama-7b-hf','codellama/CodeLlama-13b-hf'])
     parser.add_argument('--tasks',nargs='+',choices=['cnndm','gsm8k','humaneval'],default=['cnndm','gsm8k'])
     parser.add_argument('--gsm8k-profiles',nargs='+',choices=['paper64','quality512'],default=['paper64','quality512'])
+    parser.add_argument('--cnndm-max-new-tokens',nargs='+',type=int,choices=[64,512],default=[64])
     parser.add_argument('--methods',nargs='+',choices=METHODS,default=list(METHODS))
     parser.add_argument('--seeds',nargs='+',type=int,default=[2024])
     parser.add_argument('--data-seed',type=int,default=2024)
@@ -297,9 +306,7 @@ def main():
     args = parser.parse_args()
     args.split = 'train' if args.stage == 'diagnose' else 'test'
     args.data_num = args.data_num if args.data_num is not None else (16 if args.stage == 'diagnose' else 1000)
-    if not {'baseline','swift'}.issubset(args.methods):
-        parser.error('Both baseline and swift are required for aligned comparisons')
-    for values in (args.models,args.code_models,args.tasks,args.methods,args.seeds,args.gsm8k_profiles):
+    for values in (args.models,args.code_models,args.tasks,args.methods,args.seeds,args.gsm8k_profiles,args.cnndm_max_new_tokens):
         if len(set(values)) != len(values):
             parser.error('Duplicate models/tasks/methods/seeds/profiles are not supported')
     if args.split == 'train' and 'humaneval' in args.tasks:
@@ -352,7 +359,9 @@ def main():
                 rows.extend(summarize(folder,task,actual_task,model,count,seed,args))
                 write_results(output,rows)
         write_json(output/'status.json',{'status':'complete','inference_ran':True,'stage':args.stage,'rows':len(rows)})
-        note(f'DONE: {output/"results.csv"}. Diagnose results include probes; do not report them as benchmark speedups.')
+        note(f'DONE: {output/"results.csv"}')
+        if args.stage == 'diagnose':
+            note('Diagnose results include probes; do not report them as benchmark speedups.')
     except Exception as error:
         write_json(output/'failure.json',{'status':'failed','error':repr(error)})
         raise

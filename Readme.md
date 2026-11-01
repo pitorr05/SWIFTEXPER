@@ -56,6 +56,42 @@ SWIFTEXPER/
 
 ## Lệnh nhanh trên H100: nhánh nghiên cứu
 
+### Chạy riêng fixed_first 13B, đủ năm cấu hình và tự xuất CSV
+
+```bash
+cd /data/SWIFTEXPER
+git switch research/swift-mask-search
+git pull --ff-only origin research/swift-mask-search
+git fetch origin main:refs/remotes/origin/main AdaptiveCache:refs/remotes/origin/AdaptiveCache
+source .venv/bin/activate
+
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh \
+  --stage evaluate --swift-ref origin/main \
+  --models meta-llama/Llama-2-13b-hf \
+  --code-models codellama/CodeLlama-13b-hf \
+  --methods fixed_first \
+  --tasks cnndm humaneval gsm8k \
+  --cnndm-max-new-tokens 64 512 \
+  --gsm8k-profiles paper64 quality512 \
+  --data-num 1000 --data-seed 2024 --seeds 2024
+```
+
+Chạy đúng năm process inference tuần tự: CNN/DM-64, CNN/DM-512, HumanEval-512,
+GSM8K-64 và GSM8K-512. HumanEval luôn đủ 164 task; CNN/DM và GSM8K theo
+`--data-num`. Mỗi process tối ưu native trong request đầu rồi đóng băng mask
+từ request tiếp theo. Không chạy thêm baseline/SWIFT hoặc ablation khác.
+
+`results.csv` được cập nhật sau mỗi cấu hình, chứa tokens/s theo code tác giả,
+global throughput, thời gian, M/alpha, latency p50/p95, optimization time,
+HumanEval pass@1 và GSM8K accuracy/missing/token-limit rate. Không có AR/SWIFT
+thì các cột speedup, mismatch và paired correctness để trống; không tái sử dụng
+baseline 7B cho 13B. CNN/DM chưa có ROUGE trong runner này.
+
+CNN/DM mặc định vẫn 64 token với key `cnndm`; 512 dùng `cnndm.quality512`.
+Cột `max_new_tokens` ghi rõ ngân sách. CNN/DM-512 là mở rộng thực nghiệm,
+không gọi là cấu hình 64-token của paper. Source và artifacts được lưu như cũ;
+runner hiện vẫn cần ref AdaptiveCache khi chuẩn bị source, dù không chạy nó.
+
 Dùng môi trường SWIFT đang có; model ID được tải qua Hugging Face nếu chưa cache. Llama-2 cần quyền truy cập và đăng nhập sẵn. Không cài requirements của KnapSpec vào môi trường này.
 
 ```bash
@@ -160,7 +196,7 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh \
   --stage evaluate --seeds 2024 2025 2026
 ```
 
-Default methods: AR, original SWIFT, `match_uniform`, `cost_uniform`, `match_halving`, `cost_halving`, `cost_halving_refresh`, AdaptiveCache and `fixed_first` (freeze the native SWIFT mask after request one, no embedding). `--methods` can select fewer, but must include `baseline swift`. Default models are LLaMA-2-7B/13B; default tasks are CNN/DM and both GSM8K budgets. HumanEval is opt-in with `--stage evaluate --tasks humaneval`; pair `--models` with `--code-models` when overriding sizes. Only one GPU and one inference subprocess run at a time. No installation, warm-up or GPU smoke test is performed.
+Default methods: AR, original SWIFT, `match_uniform`, `cost_uniform`, `match_halving`, `cost_halving`, `cost_halving_refresh`, AdaptiveCache and `fixed_first` (freeze the native SWIFT mask after request one, no embedding). `--methods` can select any nonempty subset, including only `fixed_first`; comparison columns are populated only for references selected in that run. Default models are LLaMA-2-7B/13B; default tasks are CNN/DM (64 tokens) and both GSM8K budgets. Use `--cnndm-max-new-tokens 64 512` for both CNN/DM budgets. HumanEval is opt-in with `--stage evaluate --tasks humaneval`; pair `--models` with `--code-models` when overriding sizes. Only one GPU and one inference subprocess run at a time. No installation, warm-up or GPU smoke test is performed.
 
 Development uses train splits, excludes the one CNN/DM demonstration and five GSM8K demonstrations, and never uses HumanEval for tuning. Evaluation uses the existing test protocol. Each process starts fresh; method order rotates across seeds. Each run creates a new `_local/runs/mask_search_<timestamp>/` with original Git archives, executed source diffs, driver copies and hashes. Source edits are applied only inside those snapshots. Use `--prepare-only` to inspect them without inference.
 

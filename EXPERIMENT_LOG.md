@@ -204,3 +204,33 @@ Chỉ áp dụng trên research/swift-mask-search; không chỉnh nhánh main ho
 Chuyển bản KnapSpec chưa tracked vào _local/references/knapspec/, kiểm tra hash toàn bộ file trước/sau. Không nhập code tham khảo vào phương pháp mới. Giữ nguyên EXPERIMENT_RESULTS.md, output cũ, papers và Git worktree. Readme có bản đồ chức năng và lệnh chạy ở đầu; hai entrypoint giữ nguyên đường dẫn.
 
 Kiểm tra đã qua: cú pháp Python 3.9 của script và source snapshot, shell bash -n, prepare-only cho cả hai runner, adapter được sao chép đúng byte, source thuật toán gốc không đổi và không sinh text log. Không tải model hoặc chạy GPU.
+
+## 2026-11-01 — Chạy một phương pháp và CNN/DailyMail hai ngân sách
+
+Runner mask-search cho phép chọn một phương pháp độc lập, gồm `--methods fixed_first`.
+Trước đây CLI bắt buộc AR/SWIFT và summarizer luôn truy cập hai baseline; hiện chỉ
+đối chiếu với reference có mặt trong run. Khi thiếu reference, các cột speedup,
+token mismatch và paired correctness để trống, không đặt 0/1 hoặc ghép baseline
+7B vào run 13B. GSM8K vẫn chấm strict-format accuracy, HumanEval vẫn gọi evaluator
+pass@1 dù không có baseline. Lỗi evaluator làm run thất bại; không báo complete.
+
+Thêm `--cnndm-max-new-tokens` nhận 64/512, mặc định 64. Giữ dataset key `cnndm`
+cho 64 để tương thích output cũ; 512 dùng `cnndm.quality512`. CSV thêm cột
+`max_new_tokens`; CNN/DM-512 là mở rộng thực nghiệm, không phải thiết lập 64 token
+đối chiếu paper. Cùng data seed, sampling và prompt loader; ngân sách output tăng
+có thể làm prompt clipping khác do giới hạn context, cần giữ manifest/input IDs.
+
+Với 13B và đủ ba dataset: năm inference process mới chạy tuần tự, mỗi process
+tối ưu native ở request đầu và đóng băng từ request sau. Không thay mask algorithm,
+decoder, verification, metric protocol hoặc scoring policy. CSV cập nhật sau mỗi
+cấu hình hoàn thành, đủ năm dòng khi job thành công. Thông báo diagnostic probes
+chỉ hiện khi stage=diagnose, không còn gây nhầm cho evaluate. Không thêm text log.
+Runner vẫn chuẩn bị cả snapshot AdaptiveCache như trước; ref này cần fetch dù
+không chọn chạy nó. Readme chứa lệnh đầy đủ, không tạo thêm launcher/folder source.
+
+Kiểm tra CPU/synthetic đã qua: chuẩn bị source thật từ Git; đúng năm job fixed_first
+13B, CodeLlama riêng cho 164 HumanEval; CNN 64/512 không trùng output; CSV và GSM8K
+accuracy khi thiếu baseline; HumanEval evaluator hook và lỗi evaluator; comparison
+khi có một/hai reference; default CNN 64 và luồng cũ; Python 3.9 syntax, không text
+log. HumanEval trong kiểm tra này dùng score giả để kiểm tra orchestration, không
+phải điểm model thật. Chưa chạy LLaMA/H100, không có kết quả tốc độ mới.
