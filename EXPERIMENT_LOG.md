@@ -288,3 +288,38 @@ cân bằng domain, schedule khớp manifest, xáo thứ tự tái lập); `summ
 `mask_*`; `analyze_headroom` trên run tổng hợp có đáp án biết trước. Chưa có inference H100.
 6 paper (AdaDecode, Adaptive Speculative, Adrop, BanditSpec, Spec Bound, When Drafts Evolve)
 chưa đọc được trong phiên này; cần đối chiếu novelty trước khi code SkipBook.
+
+## 2026-11-13 — Nhánh research/skipbook: PrefillCache và SkipBook
+
+Lý do: các run cũ đều là stream đơn domain, nơi SWIFT và cache co về một mask, nên cache tối
+đa chỉ tiết kiệm search (fixed_first hơn SWIFT 1–4%). Câu hỏi còn mở là stream trộn domain và
+trần lợi ích khi chọn mask; hai thực nghiệm được giữ: E1 (stream trộn, mix ratio 0/0.3/1) và
+E2 (oracle headroom bằng `fixed_mask` trên cùng stream). D1/D4/D5 không chạy riêng.
+
+- **PrefillCache** (`--methods prefill_cache`): ngữ nghĩa AdaptiveCache (optimizer chung của
+  stream; miss → SWIFT chạy tiếp và nạp mask cuối; hit → dùng lại mask, không search, sau đó khôi
+  phục incumbent), khác duy nhất ở key: mean-pool last hidden state của prefill dense
+  (`swift_verify` trong `initialize_swift`, không phụ thuộc mask), không có forward embedding.
+  Mask được đặt sau prefill và trước draft đầu tiên.
+- **SkipBook** (`--methods skipbook`): context theo cosine ≥ τ trên key prefill; mỗi context có
+  optimizer Bayesian riêng (cùng tham số SWIFT) và trạng thái search riêng (origin_score,
+  opt_iter, tolerance_iter, optimization). Explorer = `swift_optimization` gốc, chạy khi context
+  mới (warm-start là arm tốt nhất của context gần nhất, được giữ như một arm) hoặc khi
+  Page-Hinkley phát hiện M giảm. Judge = tokens/s decode của request khai thác (trừ prefill và
+  optimization; một lần synchronize sau prefill); request search không tạo reward. Curator =
+  Discounted UCB (γ=0.95) trên reward chuẩn hóa theo trung bình context, successive elimination
+  sau ≥3 lượt, tối đa 3 arm/context, LRU 32 context.
+- Tham khảo: SWIFT (optimizer, matchness), KNN-SSD/AdaptiveCache (truy hồi theo hidden state),
+  KnapSpec (mục tiêu tokens-per-time), Garivier & Moulines 2011 (D-UCB), Even-Dar et al. 2006
+  (successive elimination), Page 1954/Hinkley 1971 (Page-Hinkley).
+- Không sửa `model/swift/*`; hook thay tên `initialize_swift` trong snapshot research và bọc
+  `forward_func`. Optimizer truyền vào SWIFT là proxy trỏ đến optimizer của context đang search.
+- Sửa lỗi: `fixed_mask` trước đây chưa được ánh xạ tới snapshot research trong runner.
+
+Kiểm tra CPU đã qua: Page-Hinkley không báo động sai trên 500 điểm dừng và phát hiện giảm 30%
+sau 5 request; D-UCB chọn đúng arm tốt (100% trong 100 lượt cuối) và loại arm kém; stream giả
+CNN→GSM8K→CNN qua hook prefill thật: tách đúng hai context, search khi context mới, quay lại CNN
+khai thác ngay mask tốt; mask được chọn đang hoạt động ở draft đầu tiên; PrefillCache dùng
+optimizer stream khi miss. Prepare-only trên snapshot Git thật và parse mọi file đã patch.
+**Chưa có kết quả GPU.** Rủi ro: few-shot chung có thể gom CNN và GSM8K vào một context
+(theo dõi `cache_similarity`, thử `--sb-key-pool last64`); reward theo request nhiễu do độ dài.

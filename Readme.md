@@ -117,6 +117,44 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh \
   --tasks cnndm gsm8k --gsm8k-profiles paper64 quality512 --seeds 2024
 ```
 
+### Nhánh research/skipbook: PrefillCache và SkipBook (E1, E2)
+
+- `prefill_cache`: giữ nguyên ngữ nghĩa AdaptiveCache, nhưng key lấy từ hidden state của prefill dense mà SWIFT đã chạy sẵn, nên không tốn embedding forward.
+- `skipbook`: mỗi context (cụm prompt theo cosine) có tối đa k mask (arm).
+  - Search SWIFT gốc chỉ chạy khi gặp context mới hoặc khi Page-Hinkley báo M giảm.
+  - Chọn arm bằng Discounted UCB, reward là tokens/s decode đo thật.
+  - Arm kém bị loại bằng successive elimination.
+
+Code ở `model/skipbook.py`.
+
+```bash
+git fetch origin && git switch research/skipbook && git pull --ff-only origin research/skipbook
+
+# E1: stream trộn CNN/DM + GSM8K, so tất cả phương pháp (train, 7B).
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh --stage diagnose --data-num 200 \
+  --models meta-llama/Llama-2-7b-hf --tasks mixed --mix-ratios 0 0.3 1 \
+  --methods baseline swift fixed_first adaptive prefill_cache skipbook \
+  --output-dir _local/runs/e1_mixed_7b
+
+# Kiểm tra không thua trên stream đơn domain.
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh --stage diagnose --data-num 128 \
+  --models meta-llama/Llama-2-7b-hf --tasks cnndm gsm8k --gsm8k-profiles quality512 \
+  --methods baseline swift fixed_first prefill_cache skipbook --output-dir _local/runs/e1_single_7b
+
+# E2: oracle headroom trên cùng stream trộn (bank lấy từ mask của E1).
+python scripts/analyze_headroom.py bank --runs _local/runs/e1_mixed_7b --random 4 --replicate \
+  --output _local/runs/bank_e1_7b.json
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh --stage diagnose --data-num 200 \
+  --models meta-llama/Llama-2-7b-hf --tasks mixed --mix-ratios 0 0.3 1 \
+  --methods baseline swift fixed_first prefill_cache skipbook fixed_mask \
+  --mask-bank _local/runs/bank_e1_7b.json --output-dir _local/runs/e2_headroom_7b
+python scripts/analyze_headroom.py analyze --run _local/runs/e2_headroom_7b
+```
+
+Ablation: `--sb-max-arms 1` (không bandit), `--sb-drift off`, `--sb-key-pool last64` (chỉ pool phần câu hỏi), `--sb-threshold`. Cột `cache_hit_rate`/`embedding_seconds` trong `results.csv` của PrefillCache/SkipBook là tỉ lệ khớp context và thời gian pooling key. Mỗi request lưu mode explore/exploit, context, arm và reward trong `forward_metrics`.
+
+Ngưỡng để đi tiếp: SkipBook ≥ SWIFT + 5% ở mix ratio ≥ 0.3, đồng thời không thua SWIFT trên stream đơn domain. Nếu đạt thì chạy `--stage evaluate`, thêm 13B và ≥ 3 seed.
+
 ### Chẩn đoán headroom D1–D4 (trước khi xây phương pháp mới)
 
 Tất cả đều dùng split train (`--stage diagnose`) và 7B trước. Chạy theo thứ tự D1 → bank → D2/D4 → D3.

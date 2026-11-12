@@ -19,7 +19,8 @@ from run_experiments import (export_source, code_sources, save_changes, check_en
 from source_patches import prepare, replace
 from research_utils import (aggregate, compare_aggregates, read_records, validate_pair, write_json)
 
-METHODS = ('baseline', 'swift', *POLICIES, 'adaptive', 'fixed_first', 'fixed_mask')
+BOOK_METHODS = ('prefill_cache', 'skipbook')
+METHODS = ('baseline', 'swift', *POLICIES, 'adaptive', 'fixed_first', 'fixed_mask', *BOOK_METHODS)
 FIELDS = ['metric_protocol', 'search_protocol', 'stage', 'split', 'seed', 'dataset', 'model',
           'method', 'samples', 'tokens', 'inference_seconds', 'tokens_per_second',
           'global_tokens_per_second', 'speedup_vs_baseline', 'speedup_vs_swift',
@@ -92,7 +93,15 @@ def patch_research(root):
     path = root / 'evaluation_llama/inference_swift.py'
     text = path.read_text(encoding='utf-8')
     text = replace(text, '    args = parser.parse_args()', '''    parser.add_argument('--fixed-mask', default=None, help='JSON attention/mlp lists, frozen for the whole stream')
-    parser.add_argument('--search-policy', choices=['fixed_first', 'fixed_mask', 'match_uniform', 'cost_uniform', 'match_halving', 'cost_halving', 'cost_halving_refresh'], required=True)
+    parser.add_argument('--sb-threshold', type=float, default=0.85)
+    parser.add_argument('--sb-max-arms', type=int, default=3)
+    parser.add_argument('--sb-capacity', type=int, default=32)
+    parser.add_argument('--sb-gamma', type=float, default=0.95)
+    parser.add_argument('--sb-ucb-c', type=float, default=0.1)
+    parser.add_argument('--sb-min-pulls', type=int, default=3)
+    parser.add_argument('--sb-drift', choices=['on', 'off'], default='on')
+    parser.add_argument('--sb-key-pool', default='mean')
+    parser.add_argument('--search-policy', choices=['fixed_first', 'fixed_mask', 'prefill_cache', 'skipbook', 'match_uniform', 'cost_uniform', 'match_halving', 'cost_halving', 'cost_halving_refresh'], required=True)
     parser.add_argument('--search-token-budget', type=int, default=824)
     parser.add_argument('--search-interval', type=int, default=32)
     parser.add_argument('--search-time-budget-ms', type=float, default=0)
@@ -107,7 +116,25 @@ def patch_research(root):
         statistics['optimization'] = False
     elif args.fixed_mask is not None:
         raise ValueError('--fixed-mask requires --search-policy fixed_mask')
-    if args.search_policy not in ('fixed_first', 'fixed_mask'):
+    book = None
+    forward_entry = swift_forward
+    if args.search_policy in ('prefill_cache', 'skipbook'):
+        from model.skipbook import SkipBook
+
+        def make_optimizer():
+            # Same construction as SWIFT's stream optimizer above.
+            fresh = BayesianOptimization(f=None, pbounds=pbounds, random_state=1, verbose=1,
+                                         allow_duplicate_points=True)
+            fresh.set_gp_params(alpha=1e-2)
+            return fresh
+        book = SkipBook(model, statistics, make_optimizer, variant=args.search_policy,
+                        threshold=args.sb_threshold, max_arms=args.sb_max_arms, capacity=args.sb_capacity,
+                        gamma=args.sb_gamma, ucb_c=args.sb_ucb_c, min_pulls=args.sb_min_pulls,
+                        drift=args.sb_drift == 'on', key_pool=args.sb_key_pool, stream_optimizer=optimizer)
+        initialize_swift = book.hook_initialize(swift_verify, swift_draft)
+        optimizer = book.optimizer
+        forward_entry = book.wrap(swift_forward)
+    elif args.search_policy not in ('fixed_first', 'fixed_mask'):
         from model.mask_search import MaskSearch
         search = MaskSearch(model, args.search_policy, seed=args.seed,
                             token_budget=args.search_token_budget, interval=args.search_interval,
@@ -121,7 +148,7 @@ def patch_research(root):
     global fixed_first_seen
     if search is not None:
         search.begin_request(swift_forward.request_context, statistics)
-    elif fixed_first_seen or frozen_stream:
+    elif (fixed_first_seen and args.search_policy == 'fixed_first') or frozen_stream:
         statistics['optimization'] = False''')
     text = replace(text, '        if tokenizer.eos_token_id in input_ids[0, input_len:].tolist() or new_token_num >= max_new_tokens:',
                    '        if search is not None:\n'
@@ -139,8 +166,10 @@ def patch_research(root):
                    '        swift_forward.last_metrics.update(search.metrics())\n'
                    '    fixed_first_seen = True\n'
                    '    return input_ids, new_token_num, idx + 1, accept_length_list, draft_token_num')
+    text = replace(text, '        forward_func=swift_forward,', '        forward_func=forward_entry,')
     write_text(path, text)
     shutil.copyfile(REPO / 'model/mask_search.py', root / 'model/mask_search.py')
+    shutil.copyfile(REPO / 'model/skipbook.py', root / 'model/skipbook.py')
 
 
 def prepare_sources(args, output):
@@ -166,7 +195,7 @@ def prepare_sources(args, output):
         'note': 'Only optimizer hook differs; original acceptance/model utility files are unchanged'})
     compile((research/'model/mask_search.py').read_text(encoding='utf-8'), 'model/mask_search.py', 'exec')
     return {'baseline': swift, 'swift': swift, 'adaptive': adaptive,
-            **{p: research for p in (*POLICIES, 'fixed_first', 'fixed_mask')}}, sources
+            **{p: research for p in (*POLICIES, 'fixed_first', 'fixed_mask', *BOOK_METHODS)}}, sources
 
 
 def method_instances(args):
@@ -340,6 +369,12 @@ def main():
     parser.add_argument('--mixed-max-new-tokens',type=int,choices=[64,512],default=64)
     parser.add_argument('--stream-order-seeds',nargs='+',type=int,default=None,
                         help='D1: permute request order per seed (default: loader order)')
+    parser.add_argument('--sb-threshold',type=float,default=0.85,help='SkipBook/PrefillCache cosine threshold')
+    parser.add_argument('--sb-max-arms',type=int,default=3,help='SkipBook arms per context (1 = no bandit)')
+    parser.add_argument('--sb-gamma',type=float,default=0.95,help='Discounted-UCB discount')
+    parser.add_argument('--sb-ucb-c',type=float,default=0.1,help='UCB width on mean-normalised rewards')
+    parser.add_argument('--sb-drift',choices=['on','off'],default='on',help='Page-Hinkley re-exploration')
+    parser.add_argument('--sb-key-pool',default='mean',help='mean or lastN (e.g. last64) prefill tokens')
     parser.add_argument('--mask-bank',type=Path,help='D2: JSON list of {name, attention, mlp} for fixed_mask')
     parser.add_argument('--gsm8k-profiles',nargs='+',choices=['paper64','quality512'],default=['paper64','quality512'])
     parser.add_argument('--cnndm-max-new-tokens',nargs='+',type=int,choices=[64,512],default=[64])
@@ -418,10 +453,14 @@ def main():
                         command += ['--optimization','--bayes','--skip-ratio',.45]
                     if method == 'adaptive':
                         command += ['--cache-enabled','--cache-clear','--cache-threshold',.85,'--cache-max-size',100]
-                    elif method in (*POLICIES,'fixed_first','fixed_mask'):
+                    elif method in (*POLICIES,'fixed_first','fixed_mask',*BOOK_METHODS):
                         command += ['--search-policy',method,'--search-token-budget',args.search_token_budget,
                                     '--search-interval',args.search_interval,'--search-time-budget-ms',args.search_time_budget_ms,
                                     '--diagnostic-samples',4 if args.stage == 'diagnose' and method in POLICIES else 0]
+                    if method in BOOK_METHODS:
+                        command += ['--sb-threshold',args.sb_threshold,'--sb-max-arms',args.sb_max_arms,
+                                    '--sb-gamma',args.sb_gamma,'--sb-ucb-c',args.sb_ucb_c,
+                                    '--sb-drift',args.sb_drift,'--sb-key-pool',args.sb_key_pool]
                     if entry is not None:
                         command += ['--fixed-mask',json.dumps({'attention':entry['attention'],'mlp':entry['mlp']})]
                     note(f'{args.stage}: {model_id}/{task}/{name}, seed {seed}, order {order_seed}, N={count}')

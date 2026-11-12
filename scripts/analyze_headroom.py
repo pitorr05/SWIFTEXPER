@@ -26,7 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'runtime'))
 from research_utils import read_records, validate_pair  # noqa: E402
 
-REFERENCES = ('baseline', 'swift', 'fixed_first', 'adaptive')
+REFERENCES = ('baseline', 'swift', 'fixed_first', 'adaptive', 'prefill_cache', 'skipbook')
 
 
 # ---------------------------------------------------------------- statistics
@@ -156,6 +156,18 @@ def headroom(task, methods):
             abs(a - b) / ((a + b) / 2) for a, b in zip(speed[k], speed[k + '_rep'])) / math.sqrt(2)
         out['output_mismatch_replicate'] = sum(
             a['tokens'] != b['tokens'] for a, b in zip(views[k], views[k + '_rep']))
+    for name in ('prefill_cache', 'skipbook'):
+        if name not in methods:
+            continue
+        metrics = [r.get('forward_metrics', {}) for r in methods[name]]
+        out[f'{name}_vs_oracle_request'] = mean_speed(refs[name]) / statistics.fmean(oracle)
+        out[f'{name}_vs_best_single'] = mean_speed(refs[name]) / per_mask[best]
+        out[f'{name}_key_seconds'] = sum(m.get('embedding_seconds', 0) for m in metrics)
+        out[f'{name}_hit_rate'] = statistics.fmean(bool(m.get('cache_hit')) for m in metrics)
+        if name == 'skipbook':
+            out['skipbook_explore_share'] = statistics.fmean(m.get('skipbook_mode') == 'explore' for m in metrics)
+            out['skipbook_contexts'] = len({m.get('skipbook_context') for m in metrics})
+            out['skipbook_drift_events'] = sum(bool(m.get('skipbook_drift')) for m in metrics)
     if 'fixed_first' in refs:
         ff = mean_speed(refs['fixed_first'])
         out['oracle_request_gain_vs_fixed_first'] = statistics.fmean(oracle) / ff - 1
@@ -306,7 +318,8 @@ def analyze(args):
     write_csv(out_dir / 'd2_per_mask.csv', per_mask_rows)
     write_csv(out_dir / 'd1_lottery_runs.csv', lot_rows)
     write_csv(out_dir / 'd1_lottery_summary.csv', lot_summary)
-    keys = ('task', 'model', 'swift_speedup', 'fixed_first_speedup', 'best_single_speedup',
+    keys = ('task', 'model', 'swift_speedup', 'fixed_first_speedup', 'prefill_cache_speedup',
+            'skipbook_speedup', 'skipbook_vs_oracle_request', 'best_single_speedup',
             'oracle_domain_speedup', 'oracle_request_speedup', 'noise_selection_inflation',
             'M_within_request_spearman', 'M_argmax_speed_regret')
     for row in head:
