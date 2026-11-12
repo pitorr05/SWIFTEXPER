@@ -166,7 +166,7 @@ def prepare_sources(args, output):
         'note': 'Only optimizer hook differs; original acceptance/model utility files are unchanged'})
     compile((research/'model/mask_search.py').read_text(encoding='utf-8'), 'model/mask_search.py', 'exec')
     return {'baseline': swift, 'swift': swift, 'adaptive': adaptive,
-            **{p: research for p in (*POLICIES, 'fixed_first')}}, sources
+            **{p: research for p in (*POLICIES, 'fixed_first', 'fixed_mask')}}, sources
 
 
 def method_instances(args):
