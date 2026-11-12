@@ -9,7 +9,8 @@ from pathlib import Path
 import numpy as np
 import torch
 from tqdm import tqdm
-from evaluation_llama.research_utils import METRIC_PROTOCOL, aggregate, digest, validate_output_path, write_json
+from evaluation_llama.research_utils import (METRIC_PROTOCOL, STREAM_PROTOCOL, aggregate, digest, mixed_schedule,
+                                             stream_permutation, validate_output_path, write_json)
 from evaluation_llama.phase_timer import finish_request
 from evaluation_llama.gsm8k import PROTOCOL as GSM8K_PROTOCOL, load_gsm8k
 from evaluation_llama.completion_decode import POLICY as DECODE_POLICY, decode_continuation
@@ -60,6 +61,8 @@ def clip_input(tokenizer, prompt, task_name, max_new_tokens=512, tree_length=250
 def load_data(task_name, seed, data_num=10):
     if data_num <= 0:
         raise ValueError('data-num must be positive')
+    if task_name == 'mixed':
+        return load_mixed(seed, data_num)
     if task_name == 'gsm8k':
         data, shots, metadata = load_gsm8k(seed, data_num)
         load_data.last_metadata = metadata
@@ -85,6 +88,43 @@ def load_data(task_name, seed, data_num=10):
         load_data.last_metadata = {'problems_sha256': digest(data)}
         return data[:data_num], ''
     raise ValueError(f'Unsupported task: {task_name}')
+
+
+MIXED_TASKS = ('cnndm', 'gsm8k')
+
+
+def load_mixed(seed, data_num):
+    """D3 stream: CNN/DM and GSM8K items share one process/model; same target LLaMA.
+
+    Each domain keeps its own few-shot prompt and loader (same split as the run);
+    only the interleaving changes with the mix ratio.
+    """
+    options = getattr(load_data, 'options', {}) or {}
+    split = options.get('research_split', 'test')
+    ratio = options.get('mix_ratio')
+    if ratio is None:
+        raise ValueError('Mixed task requires --mix-ratio')
+    counts = {name: data_num // len(MIXED_TASKS) + (i < data_num % len(MIXED_TASKS))
+              for i, name in enumerate(MIXED_TASKS)}
+    pools, shots, metadata = {}, {}, {}
+    for name in MIXED_TASKS:
+        extra = {} if split == 'test' else {'split': split}
+        items, shots[name] = load_data(name, seed, counts[name], **extra)
+        metadata[name] = getattr(load_data, 'last_metadata', {})
+        pools[name] = [dict(item, _task=name) for item in items]
+    schedule = mixed_schedule(counts, float(ratio), seed)
+    cursor = {name: 0 for name in MIXED_TASKS}
+    data = []
+    for name in schedule:
+        data.append(pools[name][cursor[name]])
+        cursor[name] += 1
+    load_data.last_metadata = {'mixed_tasks': list(MIXED_TASKS), 'mix_ratio': float(ratio),
+                               'domain_counts': counts, 'schedule': schedule, 'domains': metadata}
+    return data, shots
+
+
+def item_task(question, task_name):
+    return question.get('_task', task_name)
 
 
 def source_metadata(config, model):
@@ -121,10 +161,14 @@ def run_eval(model, tokenizer, forward_func, model_id, answer_file, max_new_toke
     with open(answer_file, 'x', encoding='utf-8') as stream:
         model.eval()
         seed_everything(seed)
+        load_data.options = dict(run_config or {})
         data, shots = load_data(task_name, data_seed, data_num)
+        order_seed = (run_config or {}).get('stream_order_seed')
+        data = [data[i] for i in stream_permutation(len(data), order_seed)]
         manifest = {'task_name': task_name, 'data_seed': data_seed,
                     'dataset': {'cnndm': 'cnn_dailymail/3.0.0/test', 'humaneval': 'human_eval/read_problems',
-                                'gsm8k': 'openai/gsm8k/main/test'}[task_name],
+                                'gsm8k': 'openai/gsm8k/main/test', 'mixed': 'mixed/cnndm+gsm8k'}[task_name],
+                    'stream_protocol': STREAM_PROTOCOL, 'stream_order_seed': order_seed,
                     'one_shot_prompt': shots, 'one_shot_sha256': digest(shots),
                     'task_ids': [q['task_id'] if task_name == 'humaneval' else q['id'] for q in data],
                     'dataset_metadata': getattr(load_data, 'last_metadata', {})}
@@ -137,8 +181,9 @@ def run_eval(model, tokenizer, forward_func, model_id, answer_file, max_new_toke
         for question in tqdm(data):
             task_id = question['task_id'] if task_name == 'humaneval' else question['id']
             forward_func.request_context = {'task_id': task_id}
-            ids = clip_input(tokenizer, question, task_name, max_new_tokens=max_new_tokens,
-                             prompt_shots=shots, max_output_length=model.config.max_position_embeddings, device=device)
+            kind = item_task(question, task_name)
+            ids = clip_input(tokenizer, question, kind, max_new_tokens=max_new_tokens,
+                             prompt_shots=shots[kind] if isinstance(shots, dict) else shots, max_output_length=model.config.max_position_embeddings, device=device)
             synchronize()
             start = time.perf_counter()
             output_ids, reported_tokens, step, lengths, draft_num = forward_func(
@@ -169,12 +214,12 @@ def run_eval(model, tokenizer, forward_func, model_id, answer_file, max_new_toke
                       'draft_token_num': int(draft_num), 'accepted_draft_tokens': accepted,
                       'acceptance_rate': accepted/draft_num if draft_num else None}
             inputs = ids[0].tolist()
-            row = {'schema_version': 1, 'task_name': task_name, 'task_id': task_id, 'model_id': model_id,
+            row = {'schema_version': 1, 'task_name': task_name, 'item_task': kind, 'task_id': task_id, 'model_id': model_id,
                    'input_token_ids': inputs, 'input_sha256': digest(inputs), 'output_token_ids': tokens,
                    'choices': [choice], 'forward_metrics': metrics, 'tstamp': time.time()}
             if task_name == 'humaneval':
                 row['completion_policy'] = DECODE_POLICY
-            if task_name == 'gsm8k':
+            if kind == 'gsm8k':
                 row.update(reference_answer=question['answer'], gsm8k_protocol=GSM8K_PROTOCOL,
                            hit_token_limit=len(tokens) == max_new_tokens,
                            termination_reason='eos' if tokens and tokens[-1] == eos else 'token_limit')

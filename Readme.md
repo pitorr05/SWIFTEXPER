@@ -117,6 +117,41 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh \
   --tasks cnndm gsm8k --gsm8k-profiles paper64 quality512 --seeds 2024
 ```
 
+### Chẩn đoán headroom D1–D4 (trước khi xây phương pháp mới)
+
+Tất cả đều dùng split train (`--stage diagnose`) và 7B trước. Chạy theo thứ tự D1 → bank → D2/D4 → D3.
+
+```bash
+# D1 First-Request Lottery: SWIFT/fixed_first trên 10 thứ tự stream khác nhau.
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh --stage diagnose --data-num 128 \
+  --models meta-llama/Llama-2-7b-hf --tasks cnndm gsm8k --gsm8k-profiles quality512 \
+  --methods baseline swift fixed_first --stream-order-seeds 1 2 3 4 5 6 7 8 9 10 \
+  --output-dir _local/runs/d1_lottery_7b
+
+# Bank mask từ D1 (+ mask uniform, 4 mask random, 1 bản lặp để đo nhiễu thời gian).
+python scripts/analyze_headroom.py bank --runs _local/runs/d1_lottery_7b \
+  --random 4 --replicate --output _local/runs/bank_7b.json
+
+# D2 oracle headroom + D4 proxy alignment: mỗi mask chạy cố định cả stream (decode cây thật).
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh --stage diagnose --data-num 128 \
+  --models meta-llama/Llama-2-7b-hf --tasks cnndm gsm8k --gsm8k-profiles quality512 \
+  --methods baseline swift fixed_first fixed_mask --mask-bank _local/runs/bank_7b.json \
+  --output-dir _local/runs/d2_headroom_7b
+
+# D3 stream trộn CNN/DM + GSM8K theo mix ratio (0 = hai khối liền nhau, 1 = luân phiên tối đa).
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh --stage diagnose --data-num 200 \
+  --models meta-llama/Llama-2-7b-hf --tasks mixed --mix-ratios 0 0.3 0.7 1 \
+  --methods baseline swift fixed_first adaptive fixed_mask --mask-bank _local/runs/bank_7b.json \
+  --output-dir _local/runs/d3_mixed_7b
+
+# Phân tích offline (CPU): CSV dưới <run>/analysis_headroom/.
+python scripts/analyze_headroom.py analyze --run _local/runs/d1_lottery_7b
+python scripts/analyze_headroom.py analyze --run _local/runs/d2_headroom_7b
+python scripts/analyze_headroom.py analyze --run _local/runs/d3_mixed_7b
+```
+
+Tiêu chí go/no-go: D1 có CV speedup SWIFT ≥ ~5% hoặc mask cuối khác nhau giữa các thứ tự; D2 có `oracle_request_gain_vs_fixed_first` ≥ 5–8% **sau khi trừ** `noise_selection_inflation`; D3 có SWIFT/fixed_first suy giảm khi mix ratio tăng. Oracle per-request là cận trên (chọn trên chính phép đo nhiễu), không phải kết quả phương pháp.
+
 Mỗi lần chạy tạo thư mục mới trong `_local/runs/`; không resume tự động. Chạy một inference process mỗi thời điểm, in trực tiếp terminal, không ghi text runtime log. JSON/CSV và source snapshot vẫn được lưu để truy nguyên. Tốc độ ở diagnose có chi phí probe bổ sung nên không dùng làm benchmark. Kiểm tra local chưa thay thế inference thật trên H100.
 
 Các mục dưới mô tả runner đối chứng, protocol và công cụ phân tích chi tiết.

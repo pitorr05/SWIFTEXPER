@@ -19,7 +19,7 @@ from run_experiments import (export_source, code_sources, save_changes, check_en
 from source_patches import prepare, replace
 from research_utils import (aggregate, compare_aggregates, read_records, validate_pair, write_json)
 
-METHODS = ('baseline', 'swift', *POLICIES, 'adaptive', 'fixed_first')
+METHODS = ('baseline', 'swift', *POLICIES, 'adaptive', 'fixed_first', 'fixed_mask')
 FIELDS = ['metric_protocol', 'search_protocol', 'stage', 'split', 'seed', 'dataset', 'model',
           'method', 'samples', 'tokens', 'inference_seconds', 'tokens_per_second',
           'global_tokens_per_second', 'speedup_vs_baseline', 'speedup_vs_swift',
@@ -29,7 +29,8 @@ FIELDS = ['metric_protocol', 'search_protocol', 'stage', 'split', 'seed', 'datas
           'candidate_input_tokens', 'mask_search_seconds', 'optimization_host_seconds',
           'diagnostic_probe_seconds', 'search_event_count', 'accuracy', 'correct',
           'missing_answer_rate', 'token_limit_rate', 'correct_to_wrong_vs_baseline',
-          'wrong_to_correct_vs_baseline', 'pass_at_1', 'max_new_tokens']
+          'wrong_to_correct_vs_baseline', 'pass_at_1', 'max_new_tokens',
+          'stream_order_seed', 'mix_ratio', 'fixed_mask']
 
 
 def write_text(path, text):
@@ -81,6 +82,8 @@ def patch_split(root):
         text = path.read_text(encoding='utf-8')
         text = replace(text, '    args = parser.parse_args()',
                        "    parser.add_argument('--research-split', choices=['train', 'test'], default='test')\n"
+                       "    parser.add_argument('--stream-order-seed', type=int, default=None)\n"
+                       "    parser.add_argument('--mix-ratio', type=float, default=None)\n"
                        '    args = parser.parse_args()')
         write_text(path, text)
 
@@ -88,14 +91,23 @@ def patch_split(root):
 def patch_research(root):
     path = root / 'evaluation_llama/inference_swift.py'
     text = path.read_text(encoding='utf-8')
-    text = replace(text, '    args = parser.parse_args()', '''    parser.add_argument('--search-policy', choices=['fixed_first', 'match_uniform', 'cost_uniform', 'match_halving', 'cost_halving', 'cost_halving_refresh'], required=True)
+    text = replace(text, '    args = parser.parse_args()', '''    parser.add_argument('--fixed-mask', default=None, help='JSON attention/mlp lists, frozen for the whole stream')
+    parser.add_argument('--search-policy', choices=['fixed_first', 'fixed_mask', 'match_uniform', 'cost_uniform', 'match_halving', 'cost_halving', 'cost_halving_refresh'], required=True)
     parser.add_argument('--search-token-budget', type=int, default=824)
     parser.add_argument('--search-interval', type=int, default=32)
     parser.add_argument('--search-time-budget-ms', type=float, default=0)
     parser.add_argument('--diagnostic-samples', type=int, default=0)
     args = parser.parse_args()''')
     text = replace(text, '    run_eval(', '''    search = None
-    if args.search_policy != 'fixed_first':
+    frozen_stream = args.search_policy == 'fixed_mask'
+    if frozen_stream:
+        import json as _json
+        _mask = _json.loads(args.fixed_mask)
+        model.set_skip_layers(np.array(_mask['attention'], dtype=int), np.array(_mask['mlp'], dtype=int))
+        statistics['optimization'] = False
+    elif args.fixed_mask is not None:
+        raise ValueError('--fixed-mask requires --search-policy fixed_mask')
+    if args.search_policy not in ('fixed_first', 'fixed_mask'):
         from model.mask_search import MaskSearch
         search = MaskSearch(model, args.search_policy, seed=args.seed,
                             token_budget=args.search_token_budget, interval=args.search_interval,
@@ -109,7 +121,7 @@ def patch_research(root):
     global fixed_first_seen
     if search is not None:
         search.begin_request(swift_forward.request_context, statistics)
-    elif fixed_first_seen:
+    elif fixed_first_seen or frozen_stream:
         statistics['optimization'] = False''')
     text = replace(text, '        if tokenizer.eos_token_id in input_ids[0, input_len:].tolist() or new_token_num >= max_new_tokens:',
                    '        if search is not None:\n'
@@ -157,10 +169,39 @@ def prepare_sources(args, output):
             **{p: research for p in (*POLICIES, 'fixed_first')}}, sources
 
 
+def method_instances(args):
+    """Expand fixed_mask into one process per bank entry; other methods map to themselves."""
+    instances = []
+    for method in args.methods:
+        if method != 'fixed_mask':
+            instances.append((method, method, None))
+            continue
+        for entry in args.bank:
+            instances.append(('mask_'+entry['name'], method, entry))
+    return instances
+
+
+def load_bank(path):
+    bank = json.loads(Path(path).read_text(encoding='utf-8'))
+    bank = bank['masks'] if isinstance(bank, dict) else bank
+    names = [str(entry['name']) for entry in bank]
+    if not bank or len(names) != len(set(names)):
+        raise ValueError('Mask bank must be a nonempty list with unique names')
+    for entry in bank:
+        if not str(entry['name']).replace('_', '').replace('-', '').isalnum():
+            raise ValueError(f'Mask name must be alphanumeric/_/-: {entry["name"]!r}')
+        entry['attention'] = sorted(map(int, entry['attention']))
+        entry['mlp'] = sorted(map(int, entry['mlp']))
+    return bank
+
+
 def configurations(args):
     for index, model in enumerate(args.models):
         for task in args.tasks:
-            if task == 'humaneval':
+            if task == 'mixed':
+                for ratio in args.mix_ratios:
+                    yield f'mixed.r{ratio:g}', task, model, args.data_num, args.mixed_max_new_tokens, .85
+            elif task == 'humaneval':
                 yield task, task, args.code_models[index], 164, 512, .95
             elif task == 'cnndm':
                 for limit in args.cnndm_max_new_tokens:
@@ -206,9 +247,11 @@ def write_diagnostics(folder, task, method, records):
             writer.writerows(rows)
 
 
-def summarize(folder, task, actual_task, model, count, seed, args):
+def summarize(folder, task, actual_task, model, count, seed, args, order_seed=None):
     records, summaries, metadata, manifests = {}, {}, [], []
-    for method in args.methods:
+    instances = method_instances(args)
+    names = [name for name, _, _ in instances]
+    for method in names:
         path = folder / f'{task}.{method}.jsonl'
         records[method] = read_records(path)
         sidecar = json.loads(Path(str(path)+'.summary.json').read_text(encoding='utf-8'))
@@ -227,8 +270,8 @@ def summarize(folder, task, actual_task, model, count, seed, args):
                 raise ValueError(f'Different method configuration: {key}')
     rows = []
     references = [m for m in ('baseline', 'swift') if m in records]
-    gsm_scores = {m: score_records(records[m], count) for m in args.methods} if actual_task == 'gsm8k' else {}
-    for method in args.methods:
+    gsm_scores = {m: score_records(records[m], count) for m in names} if actual_task == 'gsm8k' else {}
+    for method, _, entry in instances:
         for base in references:
             validate_pair(records[method], records[base])
         metrics = [r.get('forward_metrics', {}) for r in records[method]]
@@ -241,6 +284,8 @@ def summarize(folder, task, actual_task, model, count, seed, args):
         row.update(search_protocol=PROTOCOL, stage=args.stage, split=args.split,
                    seed=seed, dataset=task, model=model, method=method,
                    max_new_tokens=metadata[0]['config']['max_new_tokens'],
+                   stream_order_seed=order_seed, mix_ratio=metadata[0]['config'].get('mix_ratio'),
+                   fixed_mask=json.dumps({'attention': entry['attention'], 'mlp': entry['mlp']}) if entry else None,
                    p50_request_seconds=percentile(times,.5), p95_request_seconds=percentile(times,.95))
         for base in references:
             ratio = compare_aggregates(summary, summaries[base])
@@ -289,10 +334,16 @@ def main():
     parser.add_argument('--stage',choices=['diagnose','evaluate'],default='diagnose')
     parser.add_argument('--models',nargs='+',default=['meta-llama/Llama-2-7b-hf','meta-llama/Llama-2-13b-hf'])
     parser.add_argument('--code-models',nargs='+',default=['codellama/CodeLlama-7b-hf','codellama/CodeLlama-13b-hf'])
-    parser.add_argument('--tasks',nargs='+',choices=['cnndm','gsm8k','humaneval'],default=['cnndm','gsm8k'])
+    parser.add_argument('--tasks',nargs='+',choices=['cnndm','gsm8k','humaneval','mixed'],default=['cnndm','gsm8k'])
+    parser.add_argument('--mix-ratios',nargs='+',type=float,default=[0.0,0.3,0.7,1.0],
+                        help='D3 mixed CNN/DM+GSM8K stream; 0 = two contiguous blocks')
+    parser.add_argument('--mixed-max-new-tokens',type=int,choices=[64,512],default=64)
+    parser.add_argument('--stream-order-seeds',nargs='+',type=int,default=None,
+                        help='D1: permute request order per seed (default: loader order)')
+    parser.add_argument('--mask-bank',type=Path,help='D2: JSON list of {name, attention, mlp} for fixed_mask')
     parser.add_argument('--gsm8k-profiles',nargs='+',choices=['paper64','quality512'],default=['paper64','quality512'])
     parser.add_argument('--cnndm-max-new-tokens',nargs='+',type=int,choices=[64,512],default=[64])
-    parser.add_argument('--methods',nargs='+',choices=METHODS,default=list(METHODS))
+    parser.add_argument('--methods',nargs='+',choices=METHODS,default=[m for m in METHODS if m != 'fixed_mask'])
     parser.add_argument('--seeds',nargs='+',type=int,default=[2024])
     parser.add_argument('--data-seed',type=int,default=2024)
     parser.add_argument('--data-num',type=int)
@@ -313,6 +364,14 @@ def main():
         parser.error('HumanEval cannot be used for development; use --stage evaluate')
     if 'humaneval' in args.tasks and len(args.models) != len(args.code_models):
         parser.error('--models and --code-models must have equal length for HumanEval')
+    args.stream_order_seeds = args.stream_order_seeds or [None]
+    if len(set(args.stream_order_seeds)) != len(args.stream_order_seeds) or len(set(args.mix_ratios)) != len(args.mix_ratios):
+        parser.error('Duplicate stream order seeds or mix ratios')
+    if any(not 0 <= r <= 1 for r in args.mix_ratios):
+        parser.error('Mix ratios must lie in [0, 1]')
+    if ('fixed_mask' in args.methods) != (args.mask_bank is not None):
+        parser.error('--mask-bank is required with, and only with, --methods fixed_mask')
+    args.bank = load_bank(args.mask_bank) if args.mask_bank else []
     if (args.data_num < 1 or args.search_token_budget < 206 or args.search_interval < 1
             or not math.isfinite(args.search_time_budget_ms) or args.search_time_budget_ms < 0):
         parser.error('Invalid positive count/search budget/interval or finite time budget')
@@ -333,30 +392,41 @@ def main():
             return
         check_environment(output)
         rows = []
-        for repetition,seed in enumerate(args.seeds):
+        instances = method_instances(args)
+        repetition = 0
+        for seed in args.seeds:
+          for order_seed in args.stream_order_seeds:
             for task,actual_task,model,count,limit,top_p in configurations(args):
                 model_id = model.rstrip('/').split('/')[-1]
-                folder = output/f'seed_{seed}'/model_id
+                folder = output/f'seed_{seed}'/('loader_order' if order_seed is None else f'order_{order_seed}')/model_id
                 folder.mkdir(parents=True,exist_ok=True)
-                order = args.methods[repetition % len(args.methods):] + args.methods[:repetition % len(args.methods)]
-                for method in order:
+                # Rotate execution order across repetitions to spread drift/thermal effects.
+                shift = repetition % len(instances)
+                repetition += 1
+                for name,method,entry in instances[shift:] + instances[:shift]:
                     module = 'inference_baseline' if method == 'baseline' else 'inference_swift'
                     command = [sys.executable,'-m','evaluation_llama.'+module,'--model-path',model,
                                '--model-id',model_id,'--task-name',actual_task,'--data-num',count,
                                '--max-new-tokens',limit,'--temperature',0,'--top-p',top_p,
                                '--dtype','float16','--seed',seed,'--data-seed',args.data_seed,
-                               '--research-split',args.split,'--answer-file',folder/f'{task}.{method}.jsonl']
+                               '--research-split',args.split,'--answer-file',folder/f'{task}.{name}.jsonl']
+                    if order_seed is not None:
+                        command += ['--stream-order-seed',order_seed]
+                    if actual_task == 'mixed':
+                        command += ['--mix-ratio',float(task.split('.r',1)[1])]
                     if method != 'baseline':
                         command += ['--optimization','--bayes','--skip-ratio',.45]
                     if method == 'adaptive':
                         command += ['--cache-enabled','--cache-clear','--cache-threshold',.85,'--cache-max-size',100]
-                    elif method in (*POLICIES,'fixed_first'):
+                    elif method in (*POLICIES,'fixed_first','fixed_mask'):
                         command += ['--search-policy',method,'--search-token-budget',args.search_token_budget,
                                     '--search-interval',args.search_interval,'--search-time-budget-ms',args.search_time_budget_ms,
-                                    '--diagnostic-samples',4 if args.stage == 'diagnose' else 0]
-                    note(f'{args.stage}: {model_id}/{task}/{method}, seed {seed}, N={count}')
+                                    '--diagnostic-samples',4 if args.stage == 'diagnose' and method in POLICIES else 0]
+                    if entry is not None:
+                        command += ['--fixed-mask',json.dumps({'attention':entry['attention'],'mlp':entry['mlp']})]
+                    note(f'{args.stage}: {model_id}/{task}/{name}, seed {seed}, order {order_seed}, N={count}')
                     run(command,roots[method])
-                rows.extend(summarize(folder,task,actual_task,model,count,seed,args))
+                rows.extend(summarize(folder,task,actual_task,model,count,seed,args,order_seed))
                 write_results(output,rows)
         write_json(output/'status.json',{'status':'complete','inference_ran':True,'stage':args.stage,'rows':len(rows)})
         note(f'DONE: {output/"results.csv"}')

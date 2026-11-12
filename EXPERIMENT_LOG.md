@@ -234,3 +234,57 @@ accuracy khi thiếu baseline; HumanEval evaluator hook và lỗi evaluator; com
 khi có một/hai reference; default CNN 64 và luồng cũ; Python 3.9 syntax, không text
 log. HumanEval trong kiểm tra này dùng score giả để kiểm tra orchestration, không
 phải điểm model thật. Chưa chạy LLaMA/H100, không có kết quả tốc độ mới.
+
+
+## 2026-11-02 ? Ph?n t?ch output v? h?nh motivation
+
+Th?m `scripts/visualize_outputs.py`: ??c duy nh?t output th?t c?a Fixed-first,
+AdaptiveCache, tree-control c?ng AR/SWIFT ??i ch?ng; kh?ng s?a decoder, kh?ng
+ch?y inference, kh?ng thay output g?c. 32 JSONL / 20.116 b?n ghi request.
+??u v?o m?c ??nh `_local/visualization_selected_outputs_v1`; k?t qu? xu?t v?o
+`_local/analysis`: 5 h?nh ch?nh PDF/PNG, PDF b?o c?o 5 trang, gallery HTML,
+ph?n b? ??c ?i?m t?ng v?ng, timeline chi ti?t, CSV gh?p c?p v? provenance SHA256.
+
+Ki?m tra task ID/th? t?/input hash, manifest hash, config/package v? CSV t?i t?nh.
+B?n g?c M?latency gi? ri?ng M b?ng nhau (atol 1e-10); kh?ng jitter, kh?ng lo?i
+outlier. Ph?n tr?m gi?m latency c?a t?ng request kh?ng ph?i speedup t?ng h?p.
+M request l? mean c?c accept_lengths c?a request; M to?n run l? mean m?i v?ng.
+Timer host embedding/search/update/optimization ???c tr? m?t l?n; residual l?
+ph?n inference c?n l?i, kh?ng ???c g?i draft/verify. Kh?ng c?ng CPU/GPU timer.
+Mask heatmap ch? l? mask cu?i request. ???ng m?u kh?ng ph?i ph?n v?ng nh?n qu?.
+Tree Brier learned/raw d?ng c?ng nh?n ?? support (43.380 nh?n), n?n kh?c Brier
+trung b?nh to?n nh?n trong results.csv; h?nh ghi r? m?u s? n?y.
+
+H?c c?ch ph?n t?ch t? SWIFT (sparsity/optimization), KNN-SSD (transfer/overhead),
+Sequoia (tree/acceptance/hardware); ngu?n ch?nh l?u trong provenance v? ch? gi?i.
+Kh?ng kh?ng ??nh ki?u h?nh t? l?m n?n novelty hay b?o ??m t?ng t?c. M?t seed,
+execution tu?n t?, model revision ch?a pin l? c?c gi?i h?n c?n l?i.
+
+T?i t?o: `python scripts/visualize_outputs.py` (Python + numpy + matplotlib 3.10+).
+Kh?ng c?n torch, GPU ho?c t?i model. Artifact nghi?n c?u ? _local ???c ignore.
+
+## 2026-11-13 — Hạ tầng chẩn đoán headroom D1–D4
+
+Mục tiêu: trước khi thiết kế phương pháp mới (SkipBook: Explorer/Judge/Curator), đo xem có
+headroom thật hay không. Không đổi decoder, acceptance, metric protocol hoặc thuật toán SWIFT.
+
+- **D1 First-Request Lottery:** `--stream-order-seeds` xáo thứ tự request tái lập được
+  (`stream_permutation`, protocol `stream_order_v1`); manifest ghi seed và thứ tự task ID.
+  Câu hỏi: mask cuối và speedup của SWIFT phụ thuộc thứ tự stream đến mức nào.
+- **D2 Oracle headroom:** method `fixed_mask` + `--mask-bank` chạy SWIFT với một mask đóng băng
+  suốt stream (optimization tắt từ request đầu), một process mỗi mask. Đây là decode cây
+  thật, không phải proxy linear. `analyze_headroom.py` tính best-single, oracle theo domain,
+  oracle theo request; mask lặp `_rep` ước lượng phần thổi phồng do chọn trên phép đo nhiễu.
+- **D3 Mixed stream:** task `mixed` gộp CNN/DM + GSM8K (cùng target LLaMA, prompt few-shot
+  riêng mỗi domain, cùng split). `--mix-ratios`: 0 = hai khối liền (một lần chuyển miền),
+  r > 0 = Markov chuyển miền với xác suất r. Chỉ đo tốc độ; mixed chưa chấm accuracy.
+  Một ngân sách token chung (`--mixed-max-new-tokens`, mặc định 64).
+- **D4 Proxy alignment:** từ cùng dữ liệu D2: Spearman trong từng request giữa M/alpha và
+  tokens/s qua các mask, cùng regret khi chọn mask có M lớn nhất.
+
+Kiểm tra CPU đã qua: prepare-only trên snapshot Git thật (main + AdaptiveCache) với mọi cờ mới
+và với cấu hình mặc định; `run_eval` đã patch chạy với model/tokenizer/loader giả (split train,
+cân bằng domain, schedule khớp manifest, xáo thứ tự tái lập); `summarize` với instance
+`mask_*`; `analyze_headroom` trên run tổng hợp có đáp án biết trước. Chưa có inference H100.
+6 paper (AdaDecode, Adaptive Speculative, Adrop, BanditSpec, Spec Bound, When Drafts Evolve)
+chưa đọc được trong phiên này; cần đối chiếu novelty trước khi code SkipBook.

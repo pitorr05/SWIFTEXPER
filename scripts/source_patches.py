@@ -34,8 +34,8 @@ def patch_cli(text, swift):
     args = parser.parse_args()
     if args.max_new_tokens < 1 or args.data_num < 1 or args.warmup_runs < 0:
         parser.error('Positive token budget/data count and nonnegative warmup count required')
-    if args.task_name not in ('cnndm', 'humaneval', 'gsm8k'):
-        parser.error('Supported tasks: cnndm, humaneval, gsm8k')
+    if args.task_name not in ('cnndm', 'humaneval', 'gsm8k', 'mixed'):
+        parser.error('Supported tasks: cnndm, humaneval, gsm8k, mixed')
     if args.task_name == 'humaneval' and args.data_num > 164:
         parser.error('HumanEval contains 164 tasks')
     if args.num_gpus_total != 1 or args.num_gpus_per_model != 1:

@@ -106,3 +106,45 @@ def compare_aggregates(method, baseline):
         'global_throughput_speedup': method['global_tokens_per_second'] / baseline['global_tokens_per_second'],
         'inference_time_speedup': baseline['inference_seconds'] / method['inference_seconds'],
     }
+
+
+STREAM_PROTOCOL = 'stream_order_v1'
+
+
+def stream_permutation(count, order_seed):
+    """D1: reproducible request order; None keeps the loader order unchanged."""
+    import random
+    order = list(range(count))
+    if order_seed is not None:
+        random.Random(int(order_seed)).shuffle(order)
+    return order
+
+
+def mixed_schedule(counts, mix_ratio, seed):
+    """D3: domain label per position for a two-or-more-domain stream.
+
+    mix_ratio == 0: contiguous blocks (one abrupt shift per boundary).
+    mix_ratio > 0: Markov chain; with probability mix_ratio the next request
+    switches to a different domain that still has items (KNN-SSD style).
+    Every domain contributes exactly counts[domain] requests.
+    """
+    import random
+    if not 0 <= mix_ratio <= 1:
+        raise ValueError('mix_ratio must lie in [0, 1]')
+    names = sorted(counts)
+    if len(names) < 2 or any(counts[n] < 1 for n in names):
+        raise ValueError('Mixed stream needs >=2 domains with positive counts')
+    rng = random.Random(int(seed))
+    if mix_ratio == 0:
+        rng.shuffle(names)
+        return [n for n in names for _ in range(counts[n])]
+    left = dict(counts)
+    current = rng.choice(names)
+    schedule = []
+    for _ in range(sum(counts.values())):
+        others = [n for n in names if n != current and left[n]]
+        if left[current] == 0 or (others and rng.random() < mix_ratio):
+            current = rng.choice(others)
+        schedule.append(current)
+        left[current] -= 1
+    return schedule
