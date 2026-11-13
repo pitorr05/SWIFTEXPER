@@ -20,7 +20,19 @@ class AdaptiveCache:
         self.total_embedding_time = self.total_search_time = 0.0
         self.last_entry = None
 
+    def embedding_from_hidden(self, hidden):
+        """Key from a last hidden state [1, L, H] that SWIFT's dense prefill already computed.
+
+        Same representation as get_embedding (mean-pooled, L2-normalised last hidden state of the
+        full model), but no extra forward pass: only pooling and one device-to-host copy are paid.
+        """
+        start = time.perf_counter()
+        embedding = hidden.float().mean(dim=1).squeeze(0).cpu().numpy()
+        self.total_embedding_time += time.perf_counter() - start
+        return self._normalize(embedding)
+
     def get_embedding(self, input_ids, model):
+        """Legacy key (--cache-key embedding): one extra dense forward over the prompt."""
         import torch
         from model.swift.utils import reset_swift_mode
         start = time.perf_counter()
@@ -29,12 +41,15 @@ class AdaptiveCache:
             output = model.model(input_ids=input_ids, output_hidden_states=False,
                                  use_cache=False, return_dict=True)
             embedding = output.last_hidden_state.float().mean(dim=1).squeeze(0).cpu().numpy()
+        self.total_embedding_time += time.perf_counter() - start
+        return self._normalize(embedding)
+
+    @staticmethod
+    def _normalize(embedding):
         norm = np.linalg.norm(embedding)
         if not np.isfinite(norm) or norm <= 0:
             raise ValueError('Cannot retrieve with a zero/nonfinite embedding')
-        embedding = embedding / norm
-        self.total_embedding_time += time.perf_counter() - start
-        return embedding
+        return embedding / norm
 
     def find_similar(self, embedding):
         start = time.perf_counter()

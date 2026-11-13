@@ -132,54 +132,102 @@ def _swift_forward_impl(input_ids, model, tokenizer, max_new_tokens, statistics=
     return input_ids, new_token_num, idx + 1, accept_length_list, draft_token_num
 
 
+_dense_initialize_swift = initialize_swift
+
+
+def initialize_swift(input_ids, model, max_new_tokens, past_key_values, past_key_values_data,
+                     current_length_data, logits_processor=None):
+    """model.swift.utils.initialize_swift plus an optional hook between prefill and first draft.
+
+    The dense prefill (swift_verify) does not depend on the skip mask; the first draft does.
+    AdaptiveCache reads its key from the prefill hidden state here and may install a cached mask
+    before the first draft, so no separate embedding forward is needed. Without a hook this is
+    exactly the original function.
+    """
+    hook = getattr(swift_forward, 'prefill_hook', None)
+    if hook is None:
+        return _dense_initialize_swift(input_ids, model, max_new_tokens, past_key_values,
+                                       past_key_values_data, current_length_data,
+                                       logits_processor=logits_processor)
+    with torch.inference_mode():
+        outputs, logits = swift_verify(model, input_ids, past_key_values=past_key_values)
+        if logits_processor is not None:
+            last_logits = logits_processor(None, logits[:, -1])
+            probabilities = torch.nn.functional.softmax(last_logits, dim=1)
+            sample_token = torch.multinomial(probabilities, 1)
+        else:
+            sample_token = torch.argmax(logits[:, -1])[None, None]
+        hook(outputs[0])
+        swift_logits, top1_prob = swift_draft(
+            model, input_ids=sample_token, past_key_values_data=past_key_values_data,
+            current_length_data=current_length_data, max_new_tokens=max_new_tokens,
+            logits_processor=logits_processor)
+    return swift_logits, sample_token, top1_prob
+
+
 def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, optimizer=None, utility=None,
                   logits_processor=None, max_steps=512, cache_enabled=False, cache_threshold=0.85,
-                  cache_max_size=100, cache_file=None):
-    """Cache overlays SWIFT's stream incumbent; misses retain its optimizer state."""
+                  cache_max_size=100, cache_file=None, cache_key='prefill'):
+    """Cache overlays SWIFT's stream incumbent; misses retain its optimizer state.
+
+    cache_key='prefill' (default): key = mean-pooled last hidden state of SWIFT's own dense
+    prefill, looked up before the first draft. cache_key='embedding': legacy extra forward.
+    """
     common = dict(statistics=statistics, optimizer=optimizer, utility=utility,
                   logits_processor=logits_processor, max_steps=max_steps)
     if not cache_enabled:
         result = _swift_forward_impl(input_ids, model, tokenizer, max_new_tokens, **common)
         swift_forward.last_metrics = dict(getattr(_swift_forward_impl, 'last_metrics', {}), cache_enabled=False)
         return result
+    if cache_key not in ('prefill', 'embedding'):
+        raise ValueError(f'Unknown cache key {cache_key!r}')
     if not hasattr(swift_forward, 'cache'):
         swift_forward.cache = AdaptiveCache(cache_max_size, cache_threshold)
     cache = swift_forward.cache
     incumbent = tuple(list(map(int, x)) for x in model.get_skip_layers())
     before_iter, before_score = statistics['opt_iter'], statistics['origin_score']
     embedding_before, search_before = cache.total_embedding_time, cache.total_search_time
-    embedding = cache.get_embedding(input_ids, model)
-    attn, mlp, similarity = cache.find_similar(embedding)
-    hit = attn is not None
-    matched_entry = cache.last_entry
-    used_layers = [attn, mlp] if hit else None
     optimization_was_active = statistics['optimization']
-    if hit:
-        model.set_skip_layers(attn, mlp)
-        statistics['optimization'] = False
+    lookup = {}
+
+    def retrieve(embedding):
+        attn, mlp, similarity = cache.find_similar(embedding)
+        lookup.update(embedding=embedding, hit=attn is not None, similarity=similarity,
+                      entry=cache.last_entry, used_layers=[attn, mlp] if attn is not None else None)
+        if attn is not None:
+            model.set_skip_layers(attn, mlp)
+            statistics['optimization'] = False
+
     try:
+        if cache_key == 'embedding':
+            retrieve(cache.get_embedding(input_ids, model))
+        else:
+            swift_forward.prefill_hook = lambda hidden: retrieve(cache.embedding_from_hidden(hidden))
         result = _swift_forward_impl(input_ids, model, tokenizer, max_new_tokens, **common)
-        if not hit:
-            used_layers = [list(map(int, x)) for x in model.get_skip_layers()]
+        if 'hit' not in lookup:
+            raise RuntimeError('AdaptiveCache prefill hook did not run')
+        hit = lookup['hit']
+        used_layers = lookup['used_layers'] if hit else [list(map(int, x)) for x in model.get_skip_layers()]
         update_start = time.perf_counter()
         source = dict(getattr(swift_forward, 'request_context', {}))
         source.update({'opt_steps_on_source': statistics['opt_iter'] - before_iter,
                        'incumbent_improved_on_source': statistics['origin_score'] > before_score,
                        'origin_score': statistics['origin_score'], 'source_kind': 'stream_incumbent'})
         if not hit:
-            cache.add_to_cache(embedding, *used_layers, metadata=source)
+            cache.add_to_cache(lookup['embedding'], *used_layers, metadata=source)
         if cache_file:
             cache.save_to_file(cache_file, swift_forward.cache_identity)
         update_seconds = time.perf_counter() - update_start
         swift_forward.last_metrics = dict(getattr(_swift_forward_impl, 'last_metrics', {}),
-            cache_enabled=True, cache_hit=hit, cache_similarity=similarity,
-            cache_entry_source=matched_entry if hit else source, used_layers=used_layers,
+            cache_enabled=True, cache_key=cache_key, cache_hit=hit, cache_similarity=lookup['similarity'],
+            cache_entry_source=lookup['entry'] if hit else source, used_layers=used_layers,
             embedding_seconds=cache.total_embedding_time-embedding_before,
             search_seconds=cache.total_search_time-search_before,
             cache_update_seconds=update_seconds, cache_size=len(cache.cache))
         return result
     finally:
-        if hit:
+        swift_forward.prefill_hook = None
+        if lookup.get('hit'):
             model.set_skip_layers(*incumbent)
             statistics['optimization'] = optimization_was_active
         reset_swift_mode(model)
@@ -335,6 +383,12 @@ if __name__ == "__main__":
         help="Path to save/load cache file (e.g., cache.json)"
     )
     parser.add_argument(
+        "--cache-key",
+        choices=["prefill", "embedding"],
+        default="prefill",
+        help="prefill: key from SWIFT's dense prefill (no extra forward); embedding: legacy extra forward"
+    )
+    parser.add_argument(
         "--cache-clear",
         action="store_true",
         default=False,
@@ -405,7 +459,7 @@ if __name__ == "__main__":
     swift_forward.cache_identity = {
         'model_path': args.model_path, 'model_revision': getattr(model.config, '_commit_hash', None),
         'model_config': model.config.to_dict(), 'dtype': args.dtype,
-        'protocol': 'stream-incumbent-v1', 'context_window': args.context_window,
+        'protocol': 'stream-incumbent-v1', 'cache_key': args.cache_key, 'context_window': args.context_window,
         'skip_ratio': args.skip_ratio, 'task_name': args.task_name,
     }
     if args.cache_enabled:
@@ -435,4 +489,5 @@ if __name__ == "__main__":
         cache_threshold=args.cache_threshold,
         cache_max_size=args.cache_max_size,
         cache_file=args.cache_file,
+        cache_key=args.cache_key,
     )
