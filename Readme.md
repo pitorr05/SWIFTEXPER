@@ -81,8 +81,19 @@ git fetch origin
 git switch research/skipbook
 git pull --ff-only origin research/skipbook
 git fetch origin main:refs/remotes/origin/main AdaptiveCache:refs/remotes/origin/AdaptiveCache
+
+# Môi trường (một lần): Python 3.10, torch 2.1.2 + CUDA 12.1, transformers 4.37.1 như SWIFT.
+pip install uv   # nếu chưa có
+uv venv --python 3.10 .venv
 source .venv/bin/activate
+uv pip install -r requirements-h100.txt --build-constraint build-constraints-h100.txt
+python -c "import torch,transformers;print(torch.__version__, transformers.__version__, torch.cuda.is_available())"
+
+export HF_HOME=/data/hf_cache    # cache model/dataset trên /data
+huggingface-cli login            # token có quyền meta-llama/Llama-2-7b-hf
 ```
+
+Các lần sau chỉ cần `source .venv/bin/activate && export HF_HOME=/data/hf_cache`. `requirements.txt` là file gốc của SWIFT, giữ để tái lập; runner dùng `requirements-h100.txt`.
 
 **Bước 1. E1: stream trộn CNN/DM + GSM8K (thí nghiệm chính).** Mix ratio 0 = hai khối liền nhau, 1 = đổi domain nhiều nhất.
 
