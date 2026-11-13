@@ -87,6 +87,8 @@ pip install uv   # nếu chưa có
 uv venv --python 3.10 .venv
 source .venv/bin/activate
 uv pip install -r requirements-h100.txt --build-constraint build-constraints-h100.txt
+uv pip install pip "setuptools<70" wheel   # human-eval phải cài bằng pip (uv từ chối entry point của nó)
+python -m pip install --no-build-isolation git+https://github.com/openai/human-eval
 python -c "import torch,transformers;print(torch.__version__, transformers.__version__, torch.cuda.is_available())"
 
 export HF_HOME=/data/hf_cache    # cache model/dataset trên /data

@@ -16,4 +16,6 @@ rouge_score
 shortuuid
 tqdm
 huggingface_hub[cli]<0.26
-human-eval @ git+https://github.com/openai/human-eval
+# human-eval: its setup.py declares an invalid console script that uv rejects; install it with pip:
+#   uv pip install pip "setuptools<70" wheel
+#   python -m pip install --no-build-isolation git+https://github.com/openai/human-eval
