@@ -343,3 +343,16 @@ Kiểm tra CPU đã qua: prepare-only trên snapshot Git thật (main + Adaptive
 baseline/swift/adaptive/fixed_first/prefill_cache/skipbook/ablation, parse mọi file đã patch;
 test ablation (đúng cờ `--sb-*` cho từng tên), summarize, skipbook, stream, analyze.
 **Chưa có kết quả GPU.**
+
+## 2026-11-13 — AdaptiveCache lấy key từ prefill (nhánh AdaptiveCache, a7d780f)
+
+- Nhánh `AdaptiveCache`: key = mean-pool last hidden state của prefill dense (`swift_verify`) mà
+  SWIFT đã chạy, thay cho forward embedding riêng. Tra cache chạy giữa prefill và draft đầu tiên;
+  hit thì đặt mask trước draft đầu tiên. Cùng representation, ngưỡng, LRU và ngữ nghĩa miss
+  (stream incumbent). Không sửa `model/swift/*`; `initialize_swift` trong `inference_swift.py`
+  có hook, không có hook thì gọi đúng hàm gốc. `--cache-key embedding` giữ đường cũ.
+- Runner `research/skipbook`: `adaptive` = key prefill (mặc định của nhánh), `adaptive_embed` =
+  key cũ, để đo phần tiết kiệm trong cùng bảng. Số `adaptive` cũ trong `_local/runs` là key embedding.
+- Kiểm tra CPU: stub verify/draft, stream CNN→CNN→GSM→GSM→CNN: đúng 1 forward dense/request,
+  hit/miss [m,h,m,h,h], mask cache có hiệu lực từ draft đầu tiên, trạng thái optimization được
+  khôi phục; prepare-only với origin/AdaptiveCache mới áp patch được. **Chưa có kết quả GPU.**

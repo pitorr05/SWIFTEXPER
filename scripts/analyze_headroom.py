@@ -26,7 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'runtime'))
 from research_utils import read_records, validate_pair  # noqa: E402
 
-REFERENCES = ('baseline', 'swift', 'fixed_first', 'adaptive', 'prefill_cache', 'skipbook')
+REFERENCES = ('baseline', 'swift', 'fixed_first', 'adaptive', 'adaptive_embed', 'prefill_cache', 'skipbook')
 
 
 def is_reference(name):
@@ -338,7 +338,7 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     b = sub.add_parser('bank')
     b.add_argument('--runs', nargs='+', required=True, help='Run directories to harvest masks from')
-    b.add_argument('--methods', nargs='+', default=['swift', 'fixed_first', 'adaptive'])
+    b.add_argument('--methods', nargs='+', default=['swift', 'fixed_first', 'adaptive', 'adaptive_embed'])
     b.add_argument('--layers', type=int, default=None)
     b.add_argument('--random', type=int, default=4, help='Extra random masks (lower-bound arms)')
     b.add_argument('--skip-ratio', type=float, default=.45)

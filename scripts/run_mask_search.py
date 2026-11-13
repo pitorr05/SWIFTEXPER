@@ -28,7 +28,9 @@ ABLATIONS = {
     'skipbook_q64': {'sb_key_pool': 'last64'},  # key from the last 64 prompt tokens only
 }
 RESEARCH_METHODS = ('fixed_first', 'fixed_mask', *BOOK_METHODS, *ABLATIONS)
-METHODS = ('baseline', 'swift', 'adaptive', *RESEARCH_METHODS)
+# adaptive = AdaptiveCache branch (key from SWIFT's prefill); adaptive_embed = its legacy extra-forward key.
+ADAPTIVE_METHODS = ('adaptive', 'adaptive_embed')
+METHODS = ('baseline', 'swift', *ADAPTIVE_METHODS, *RESEARCH_METHODS)
 DEFAULT_METHODS = ('baseline', 'swift', 'fixed_first', 'prefill_cache', 'skipbook')
 SB_KEYS = ('sb_threshold', 'sb_max_arms', 'sb_gamma', 'sb_ucb_c', 'sb_drift', 'sb_key_pool')
 FIELDS = ['metric_protocol', 'search_protocol', 'stage', 'split', 'seed', 'dataset', 'model',
@@ -175,7 +177,7 @@ def prepare_sources(args, output):
         'skipbook_sha256': hashlib.sha256((REPO/'model/skipbook.py').read_bytes()).hexdigest(),
         'note': 'Only mask selection hooks differ; original acceptance/model utility files are unchanged'})
     compile((research/'model/skipbook.py').read_text(encoding='utf-8'), 'model/skipbook.py', 'exec')
-    return {'baseline': swift, 'swift': swift, 'adaptive': adaptive,
+    return {'baseline': swift, 'swift': swift, **{m: adaptive for m in ADAPTIVE_METHODS},
             **{p: research for p in RESEARCH_METHODS}}, sources
 
 
@@ -412,8 +414,9 @@ def main():
                         command += ['--mix-ratio',float(task.split('.r',1)[1])]
                     if method != 'baseline':
                         command += ['--optimization','--bayes','--skip-ratio',.45]
-                    if method == 'adaptive':
-                        command += ['--cache-enabled','--cache-clear','--cache-threshold',.85,'--cache-max-size',100]
+                    if method in ADAPTIVE_METHODS:
+                        command += ['--cache-enabled','--cache-clear','--cache-threshold',.85,'--cache-max-size',100,
+                                    '--cache-key','embedding' if method == 'adaptive_embed' else 'prefill']
                     elif method in RESEARCH_METHODS:
                         command += ['--search-policy',method]
                     if method in BOOK_METHODS:
