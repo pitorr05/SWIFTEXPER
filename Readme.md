@@ -40,7 +40,7 @@ SWIFTEXPER/
 ## Phân biệt code gốc và contribution
 
 - **main** giữ source SWIFT gốc cùng công cụ thực nghiệm. Runner áp dụng hiệu chỉnh harness/runtime trên snapshot, không sửa working source.
-- **AdaptiveCache** chứa cache retrieval của contribution trước. Runner đọc source đã commit từ `origin/AdaptiveCache`.
+- **AdaptiveCache** chứa cache retrieval của contribution trước. Từ a7d780f, key lấy từ prefill của SWIFT (`--cache-key prefill`, mặc định); `--cache-key embedding` giữ cách cũ. Runner đọc source đã commit từ `origin/AdaptiveCache`.
 - **research/swift-mask-search** (lưu trữ): 5 policy chọn mask (`match_/cost_ uniform/halving/refresh`) đã chạy và **thua SWIFT**; chỉ `fixed_first` có lợi (+1–4%). Các policy này đã bị xoá khỏi nhánh hiện tại; code và kết quả vẫn ở nhánh đó và trong `_local/runs`.
 - **research/skipbook** (nhánh này): `prefill_cache`, `skipbook`, các ablation có tên và oracle `fixed_mask`. Chưa có kết quả GPU; chưa xác lập speedup hay novelty.
 
@@ -52,9 +52,10 @@ SWIFTEXPER/
 |---|---|
 | `baseline` | Autoregressive (AR) |
 | `swift` | SWIFT gốc: search mask online suốt stream |
-| `adaptive` | AdaptiveCache cũ: cache mask theo embedding prompt (tốn thêm 1 forward) |
+| `adaptive` | AdaptiveCache (nhánh `AdaptiveCache`, từ a7d780f): key lấy từ prefill dense SWIFT đã chạy, không tốn forward thêm |
+| `adaptive_embed` | AdaptiveCache với key cũ (`--cache-key embedding`: thêm 1 forward); dùng để đo phần tiết kiệm và so với số cũ |
 | `fixed_first` | SWIFT search ở request đầu rồi đóng băng mask |
-| `prefill_cache` | AdaptiveCache nhưng key lấy từ prefill dense có sẵn (không tốn forward) |
+| `prefill_cache` | Cùng ngữ nghĩa với `adaptive` nhưng chạy qua `model/skipbook.py` (kiểm tra chéo hai bản cài đặt) |
 | `skipbook` | **Phương pháp chính** (xem dưới) |
 | `skipbook_k1` | Ablation: 1 mask mỗi context (bỏ bandit) |
 | `skipbook_nodrift` | Ablation: tắt Page-Hinkley (không search lại khi M giảm) |
@@ -88,7 +89,7 @@ source .venv/bin/activate
 ```bash
 CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh --stage diagnose --data-num 200 \
   --swift-ref origin/main --models meta-llama/Llama-2-7b-hf --tasks mixed --mix-ratios 0 0.3 1 \
-  --methods baseline swift fixed_first adaptive prefill_cache skipbook \
+  --methods baseline swift fixed_first adaptive adaptive_embed skipbook \
   --output-dir _local/runs/e1_mixed_7b
 ```
 
