@@ -1,14 +1,15 @@
 # SWIFTEXPER
 
-Repo thực nghiệm self-speculative decoding trên một GPU H100. Nhánh hiện tại: **research/swift-mask-search**.
+Repo thực nghiệm self-speculative decoding trên một GPU H100. Nhánh hiện tại: **research/skipbook**.
 
 ## Bắt đầu từ đâu?
 
 | Bạn cần làm gì? | File cần đọc hoặc chạy |
 |---|---|
-| Chạy AR, SWIFT và AdaptiveCache | `bash scripts/run_h100.sh` |
-| Chạy nghiên cứu mask-search và ablation | `bash scripts/run_mask_search.sh` |
-| Đọc thuật toán mới | `model/mask_search.py` |
+| Chạy AR, SWIFT và AdaptiveCache (protocol cũ) | `bash scripts/run_h100.sh` |
+| Chạy SkipBook, PrefillCache, oracle và ablation | `bash scripts/run_mask_search.sh` |
+| Đọc thuật toán mới | `model/skipbook.py` |
+| Phân tích oracle headroom (CPU) | `scripts/analyze_headroom.py` |
 | Đọc model, decoding và KV cache gốc | `model/swift/` |
 | Đọc inference gốc | `evaluation_llama/inference_baseline.py`, `inference_swift.py` |
 | Đọc logic tổ chức thí nghiệm | `scripts/run_experiments.py`, `run_mask_search.py` |
@@ -24,175 +25,123 @@ SWIFTEXPER/
 |-- requirements.txt         # Môi trường SWIFT gốc
 |-- evaluation_llama/        # Inference và đánh giá gốc
 |-- model/
-|   |-- swift/               # Model, decoding, KV cache gốc
-|   `-- mask_search.py       # Thuật toán nghiên cứu mới
+|   |-- swift/               # Model, decoding, KV cache gốc (không sửa)
+|   `-- skipbook.py          # SkipBook + PrefillCache
 |-- scripts/
 |   |-- run_h100.sh          # AR / SWIFT / AdaptiveCache
-|   |-- run_mask_search.sh   # Nghiên cứu mới và ablation
+|   |-- run_mask_search.sh   # SkipBook, PrefillCache, fixed_mask, ablation
+|   |-- analyze_headroom.py  # Bank mask + oracle headroom (CPU)
 |   |-- *.py                 # Điều phối, chuẩn bị source, chấm, tổng hợp
 |   `-- runtime/             # Python hỗ trợ snapshot thực nghiệm
 |-- assets/                  # Hình minh họa paper
-|-- eval_llama.sh            # Ví dụ launcher gốc
-|-- skip_layers.json         # Cấu hình layer tĩnh gốc
-`-- _local/                  # Không đưa lên Git
-    |-- runs/                # Output, điểm, source snapshot, provenance
-    |-- papers/              # Paper tham khảo
-    |-- references/knapspec/ # Code tham khảo cục bộ
-    |-- worktrees/           # Git worktree: không tự di chuyển/xóa
-    `-- ...                  # Archive, verification và cache
+`-- _local/                  # Không đưa lên Git: runs/, papers/, references/, worktrees/
 ```
-
-`EXPERIMENT_RESULTS.md`, nếu có ở máy của bạn, là báo cáo cục bộ được giữ nguyên; runner không phụ thuộc file này.
 
 ## Phân biệt code gốc và contribution
 
-- **main** giữ source thuật toán SWIFT gốc cùng công cụ thực nghiệm. Runner áp dụng hiệu chỉnh harness/runtime có ghi nhận trên snapshot, không sửa working source gốc.
-- **AdaptiveCache** chứa cache retrieval và lifecycle của contribution trước. Runner đọc source đã commit từ `origin/AdaptiveCache`.
-- **research/swift-mask-search** thêm lựa chọn mask theo ngân sách, objective và cửa sổ context. Đây là prototype cần thực nghiệm; chưa xác lập speedup hay novelty.
+- **main** giữ source SWIFT gốc cùng công cụ thực nghiệm. Runner áp dụng hiệu chỉnh harness/runtime trên snapshot, không sửa working source.
+- **AdaptiveCache** chứa cache retrieval của contribution trước. Runner đọc source đã commit từ `origin/AdaptiveCache`.
+- **research/swift-mask-search** (lưu trữ): 5 policy chọn mask (`match_/cost_ uniform/halving/refresh`) đã chạy và **thua SWIFT**; chỉ `fixed_first` có lợi (+1–4%). Các policy này đã bị xoá khỏi nhánh hiện tại; code và kết quả vẫn ở nhánh đó và trong `_local/runs`.
+- **research/skipbook** (nhánh này): `prefill_cache`, `skipbook`, các ablation có tên và oracle `fixed_mask`. Chưa có kết quả GPU; chưa xác lập speedup hay novelty.
 
-`evaluation_llama/speed.py` là code tác giả giữ nguyên. `scripts/runtime/speed_adapter.py` là adapter metric research, được xuất thành `evaluation_llama/speed.py` trong snapshot. Không cần chạy thủ công cả hai để có bảng tổng hợp.
+`runtime/` gồm `harness.py` (vòng đánh giá, task `mixed`), `research_utils.py` (metric/output/stream), `gsm8k.py`, `completion_decode.py`, `phase_timer.py` và `speed_adapter.py`. `source_patches.py` chuẩn bị snapshot bằng các module này.
 
-`runtime/` gồm `harness.py` (vòng đánh giá), `research_utils.py` (metric/output), `gsm8k.py` (dữ liệu/accuracy), `completion_decode.py`, `phase_timer.py` và `speed_adapter.py`. `source_patches.py` chuẩn bị snapshot bằng các module này.
+## Các phương pháp
 
-## Lệnh nhanh trên H100: nhánh nghiên cứu
+| `--methods` | Là gì |
+|---|---|
+| `baseline` | Autoregressive (AR) |
+| `swift` | SWIFT gốc: search mask online suốt stream |
+| `adaptive` | AdaptiveCache cũ: cache mask theo embedding prompt (tốn thêm 1 forward) |
+| `fixed_first` | SWIFT search ở request đầu rồi đóng băng mask |
+| `prefill_cache` | AdaptiveCache nhưng key lấy từ prefill dense có sẵn (không tốn forward) |
+| `skipbook` | **Phương pháp chính** (xem dưới) |
+| `skipbook_k1` | Ablation: 1 mask mỗi context (bỏ bandit) |
+| `skipbook_nodrift` | Ablation: tắt Page-Hinkley (không search lại khi M giảm) |
+| `skipbook_onectx` | Ablation: mọi request chung 1 context (bỏ phân cụm prompt) |
+| `skipbook_q64` | Ablation: key chỉ từ 64 token cuối của prompt |
+| `fixed_mask` | Oracle: mỗi mask trong `--mask-bank` chạy cố định cả stream |
 
-### Chạy riêng fixed_first 13B, đủ năm cấu hình và tự xuất CSV
+**SkipBook, mỗi request:**
+1. Prefill dense (SWIFT vốn chạy).
+2. Mean-pool hidden state → key (~0 giây).
+3. Tìm context theo cosine ≥ `--sb-threshold`.
+   - Context mới → **Explore**: chạy search gốc của SWIFT với optimizer Bayes riêng của context, warm-start từ mask tốt nhất của context gần nhất. Mask tìm được thành một arm.
+   - Context cũ → **Exploit**: Discounted UCB chọn 1 trong ≤ `--sb-max-arms` arm, khoá mask, không search. Reward là tokens/s decode đo thật.
+4. Page-Hinkley theo dõi M; khi M giảm thì Explore lại. Arm thua rõ bị loại (successive elimination).
 
-```bash
-cd /data/SWIFTEXPER
-git switch research/swift-mask-search
-git pull --ff-only origin research/swift-mask-search
-git fetch origin main:refs/remotes/origin/main AdaptiveCache:refs/remotes/origin/AdaptiveCache
-source .venv/bin/activate
+Mặc định `--methods` = `baseline swift fixed_first prefill_cache skipbook`.
 
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh \
-  --stage evaluate --swift-ref origin/main \
-  --models meta-llama/Llama-2-13b-hf \
-  --code-models codellama/CodeLlama-13b-hf \
-  --methods fixed_first \
-  --tasks cnndm humaneval gsm8k \
-  --cnndm-max-new-tokens 64 512 \
-  --gsm8k-profiles paper64 quality512 \
-  --data-num 1000 --data-seed 2024 --seeds 2024
-```
-
-Chạy đúng năm process inference tuần tự: CNN/DM-64, CNN/DM-512, HumanEval-512,
-GSM8K-64 và GSM8K-512. HumanEval luôn đủ 164 task; CNN/DM và GSM8K theo
-`--data-num`. Mỗi process tối ưu native trong request đầu rồi đóng băng mask
-từ request tiếp theo. Không chạy thêm baseline/SWIFT hoặc ablation khác.
-
-`results.csv` được cập nhật sau mỗi cấu hình, chứa tokens/s theo code tác giả,
-global throughput, thời gian, M/alpha, latency p50/p95, optimization time,
-HumanEval pass@1 và GSM8K accuracy/missing/token-limit rate. Không có AR/SWIFT
-thì các cột speedup, mismatch và paired correctness để trống; không tái sử dụng
-baseline 7B cho 13B. CNN/DM chưa có ROUGE trong runner này.
-
-CNN/DM mặc định vẫn 64 token với key `cnndm`; 512 dùng `cnndm.quality512`.
-Cột `max_new_tokens` ghi rõ ngân sách. CNN/DM-512 là mở rộng thực nghiệm,
-không gọi là cấu hình 64-token của paper. Source và artifacts được lưu như cũ;
-runner hiện vẫn cần ref AdaptiveCache khi chuẩn bị source, dù không chạy nó.
-
-Dùng môi trường SWIFT đang có; model ID được tải qua Hugging Face nếu chưa cache. Llama-2 cần quyền truy cập và đăng nhập sẵn. Không cài requirements của KnapSpec vào môi trường này.
+## Chạy trên H100 (theo thứ tự)
 
 ```bash
 cd /data/SWIFTEXPER
 git fetch origin
-git switch research/swift-mask-search
-git pull --ff-only origin research/swift-mask-search
-git fetch origin AdaptiveCache:refs/remotes/origin/AdaptiveCache
+git switch research/skipbook
+git pull --ff-only origin research/skipbook
+git fetch origin main:refs/remotes/origin/main AdaptiveCache:refs/remotes/origin/AdaptiveCache
 source .venv/bin/activate
-
-# Diagnostic: 16 câu train, 7B, chín phương pháp tuần tự.
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh \
-  --stage diagnose --models meta-llama/Llama-2-7b-hf \
-  --tasks gsm8k --gsm8k-profiles paper64
 ```
 
-Sau khi phân tích diagnostic và chốt protocol, đánh giá test:
+**Bước 1. E1: stream trộn CNN/DM + GSM8K (thí nghiệm chính).** Mix ratio 0 = hai khối liền nhau, 1 = đổi domain nhiều nhất.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh \
-  --stage evaluate \
-  --models meta-llama/Llama-2-7b-hf meta-llama/Llama-2-13b-hf \
-  --tasks cnndm gsm8k --gsm8k-profiles paper64 quality512 --seeds 2024
-```
-
-### Nhánh research/skipbook: PrefillCache và SkipBook (E1, E2)
-
-- `prefill_cache`: giữ nguyên ngữ nghĩa AdaptiveCache, nhưng key lấy từ hidden state của prefill dense mà SWIFT đã chạy sẵn, nên không tốn embedding forward.
-- `skipbook`: mỗi context (cụm prompt theo cosine) có tối đa k mask (arm).
-  - Search SWIFT gốc chỉ chạy khi gặp context mới hoặc khi Page-Hinkley báo M giảm.
-  - Chọn arm bằng Discounted UCB, reward là tokens/s decode đo thật.
-  - Arm kém bị loại bằng successive elimination.
-
-Code ở `model/skipbook.py`.
-
-```bash
-git fetch origin && git switch research/skipbook && git pull --ff-only origin research/skipbook
-
-# E1: stream trộn CNN/DM + GSM8K, so tất cả phương pháp (train, 7B).
 CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh --stage diagnose --data-num 200 \
-  --models meta-llama/Llama-2-7b-hf --tasks mixed --mix-ratios 0 0.3 1 \
+  --swift-ref origin/main --models meta-llama/Llama-2-7b-hf --tasks mixed --mix-ratios 0 0.3 1 \
   --methods baseline swift fixed_first adaptive prefill_cache skipbook \
   --output-dir _local/runs/e1_mixed_7b
+```
 
-# Kiểm tra không thua trên stream đơn domain.
+**Bước 2. Stream đơn domain** (SkipBook không được thua SWIFT):
+
+```bash
 CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh --stage diagnose --data-num 128 \
-  --models meta-llama/Llama-2-7b-hf --tasks cnndm gsm8k --gsm8k-profiles quality512 \
-  --methods baseline swift fixed_first prefill_cache skipbook --output-dir _local/runs/e1_single_7b
+  --swift-ref origin/main --models meta-llama/Llama-2-7b-hf --tasks cnndm gsm8k --gsm8k-profiles quality512 \
+  --methods baseline swift fixed_first prefill_cache skipbook \
+  --output-dir _local/runs/e1_single_7b
+```
 
-# E2: oracle headroom trên cùng stream trộn (bank lấy từ mask của E1).
+Xem `results.csv`: cột `speedup_vs_swift`, `skipbook_contexts` (≈ 2 trên stream trộn là đúng), `skipbook_explore_share`, `cache_hit_rate`. Nếu `skipbook_contexts` = 1 trên stream trộn thì key gộp CNN và GSM8K; khi đó thêm `skipbook_q64` vào bước 3.
+
+**Ngưỡng đi tiếp:** SkipBook ≥ SWIFT + 5% ở mix ratio ≥ 0.3 **và** không thua SWIFT ở bước 2. Không đạt thì dừng và gửi CSV để phân tích, chưa chạy bước 3–4.
+
+**Bước 3. Ablation** (một lệnh, một bảng):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh --stage diagnose --data-num 200 \
+  --swift-ref origin/main --models meta-llama/Llama-2-7b-hf --tasks mixed --mix-ratios 0.3 \
+  --methods baseline swift prefill_cache skipbook skipbook_k1 skipbook_nodrift skipbook_onectx skipbook_q64 \
+  --output-dir _local/runs/e1_ablation_7b
+```
+
+**Bước 4. E2: oracle headroom** ("SkipBook đạt bao nhiêu % so với chọn mask hoàn hảo"):
+
+```bash
 python scripts/analyze_headroom.py bank --runs _local/runs/e1_mixed_7b --random 4 --replicate \
   --output _local/runs/bank_e1_7b.json
 CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh --stage diagnose --data-num 200 \
-  --models meta-llama/Llama-2-7b-hf --tasks mixed --mix-ratios 0 0.3 1 \
+  --swift-ref origin/main --models meta-llama/Llama-2-7b-hf --tasks mixed --mix-ratios 0.3 1 \
   --methods baseline swift fixed_first prefill_cache skipbook fixed_mask \
   --mask-bank _local/runs/bank_e1_7b.json --output-dir _local/runs/e2_headroom_7b
 python scripts/analyze_headroom.py analyze --run _local/runs/e2_headroom_7b
 ```
 
-Ablation: `--sb-max-arms 1` (không bandit), `--sb-drift off`, `--sb-key-pool last64` (chỉ pool phần câu hỏi), `--sb-threshold`. Cột `cache_hit_rate`/`embedding_seconds` trong `results.csv` của PrefillCache/SkipBook là tỉ lệ khớp context và thời gian pooling key. Mỗi request lưu mode explore/exploit, context, arm và reward trong `forward_metrics`.
+`analysis_headroom/d2_d4_headroom.csv` có `skipbook_vs_oracle_request`, `best_single_speedup`, `oracle_domain_speedup`, `noise_selection_inflation` (nhiễu đo thời gian; trừ đi trước khi kết luận) và `M_within_request_spearman` (M có dự báo tốc độ không).
 
-Ngưỡng để đi tiếp: SkipBook ≥ SWIFT + 5% ở mix ratio ≥ 0.3, đồng thời không thua SWIFT trên stream đơn domain. Nếu đạt thì chạy `--stage evaluate`, thêm 13B và ≥ 3 seed.
+**Bước 5. Bảng paper** (chỉ sau khi bước 1–4 tốt): lặp bước 1–3 với `--stage evaluate` (split test), thêm `meta-llama/Llama-2-13b-hf` và `--seeds 2024 2025 2026`.
 
-### Chẩn đoán headroom D1–D4 (trước khi xây phương pháp mới)
+`diagnose` dùng split train để chỉnh tham số; số trong paper lấy từ `evaluate`. Mỗi lần chạy tạo thư mục mới trong `_local/runs/` (không resume). Một inference process mỗi thời điểm, in trực tiếp terminal. Kiểm tra CPU chưa thay thế inference thật trên H100.
 
-Tất cả đều dùng split train (`--stage diagnose`) và 7B trước. Chạy theo thứ tự D1 → bank → D2/D4 → D3.
+### Các tuỳ chọn khác
 
-```bash
-# D1 First-Request Lottery: SWIFT/fixed_first trên 10 thứ tự stream khác nhau.
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh --stage diagnose --data-num 128 \
-  --models meta-llama/Llama-2-7b-hf --tasks cnndm gsm8k --gsm8k-profiles quality512 \
-  --methods baseline swift fixed_first --stream-order-seeds 1 2 3 4 5 6 7 8 9 10 \
-  --output-dir _local/runs/d1_lottery_7b
+- `--stream-order-seeds 1 2 3 ...`: hoán vị thứ tự request (đo độ nhạy của SWIFT với request đầu).
+- `--sb-threshold`, `--sb-max-arms`, `--sb-gamma`, `--sb-ucb-c`, `--sb-drift`, `--sb-key-pool`: tham số mặc định của SkipBook/PrefillCache; ablation có tên ghi đè từng tham số.
+- Chạy riêng `fixed_first` 13B trên năm cấu hình cũ:
+  `--stage evaluate --swift-ref origin/main --models meta-llama/Llama-2-13b-hf --code-models codellama/CodeLlama-13b-hf --methods fixed_first --tasks cnndm humaneval gsm8k --cnndm-max-new-tokens 64 512 --gsm8k-profiles paper64 quality512 --data-num 1000`
 
-# Bank mask từ D1 (+ mask uniform, 4 mask random, 1 bản lặp để đo nhiễu thời gian).
-python scripts/analyze_headroom.py bank --runs _local/runs/d1_lottery_7b \
-  --random 4 --replicate --output _local/runs/bank_7b.json
+Dùng môi trường SWIFT đang có; Llama-2 cần quyền truy cập Hugging Face sẵn. Runner cần ref AdaptiveCache khi chuẩn bị source, kể cả khi không chạy `adaptive`.
 
-# D2 oracle headroom + D4 proxy alignment: mỗi mask chạy cố định cả stream (decode cây thật).
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh --stage diagnose --data-num 128 \
-  --models meta-llama/Llama-2-7b-hf --tasks cnndm gsm8k --gsm8k-profiles quality512 \
-  --methods baseline swift fixed_first fixed_mask --mask-bank _local/runs/bank_7b.json \
-  --output-dir _local/runs/d2_headroom_7b
-
-# D3 stream trộn CNN/DM + GSM8K theo mix ratio (0 = hai khối liền nhau, 1 = luân phiên tối đa).
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh --stage diagnose --data-num 200 \
-  --models meta-llama/Llama-2-7b-hf --tasks mixed --mix-ratios 0 0.3 0.7 1 \
-  --methods baseline swift fixed_first adaptive fixed_mask --mask-bank _local/runs/bank_7b.json \
-  --output-dir _local/runs/d3_mixed_7b
-
-# Phân tích offline (CPU): CSV dưới <run>/analysis_headroom/.
-python scripts/analyze_headroom.py analyze --run _local/runs/d1_lottery_7b
-python scripts/analyze_headroom.py analyze --run _local/runs/d2_headroom_7b
-python scripts/analyze_headroom.py analyze --run _local/runs/d3_mixed_7b
-```
-
-Tiêu chí go/no-go: D1 có CV speedup SWIFT ≥ ~5% hoặc mask cuối khác nhau giữa các thứ tự; D2 có `oracle_request_gain_vs_fixed_first` ≥ 5–8% **sau khi trừ** `noise_selection_inflation`; D3 có SWIFT/fixed_first suy giảm khi mix ratio tăng. Oracle per-request là cận trên (chọn trên chính phép đo nhiễu), không phải kết quả phương pháp.
-
-Mỗi lần chạy tạo thư mục mới trong `_local/runs/`; không resume tự động. Chạy một inference process mỗi thời điểm, in trực tiếp terminal, không ghi text runtime log. JSON/CSV và source snapshot vẫn được lưu để truy nguyên. Tốc độ ở diagnose có chi phí probe bổ sung nên không dùng làm benchmark. Kiểm tra local chưa thay thế inference thật trên H100.
-
-Các mục dưới mô tả runner đối chứng, protocol và công cụ phân tích chi tiết.
+Các mục dưới mô tả runner protocol cũ và công cụ phân tích chi tiết.
 
 ## Run on the H100 server
 
@@ -251,37 +200,9 @@ Both GSM8K profiles use the same seeded 1,000 test questions and five train demo
 
 ## Results and reproducibility
 
-### Research branch: controlled mask-search ablations
+### Research branch: controlled mask-search ablations (archived)
 
-On `research/swift-mask-search`, the three new source files are `model/mask_search.py` (selection and isolated replay), `scripts/run_mask_search.py` (snapshots, data splits, metrics), and `scripts/run_mask_search.sh` (launcher). Existing inference/model files and the original H100 launcher stay unchanged. `_local/references/knapspec/` is not imported or copied into this experiment.
-
-```bash
-# First diagnostic: 16 train questions, 7B, all nine methods sequentially.
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh \
-  --stage diagnose --models meta-llama/Llama-2-7b-hf \
-  --tasks gsm8k --gsm8k-profiles paper64
-
-# Larger development diagnostic on both model sizes; no test-set tuning.
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh --stage diagnose --data-num 128
-
-# Full evaluation only after selecting the protocol on development data.
-CUDA_VISIBLE_DEVICES=0 bash scripts/run_mask_search.sh \
-  --stage evaluate --seeds 2024 2025 2026
-```
-
-Default methods: AR, original SWIFT, `match_uniform`, `cost_uniform`, `match_halving`, `cost_halving`, `cost_halving_refresh`, AdaptiveCache and `fixed_first` (freeze the native SWIFT mask after request one, no embedding). `--methods` can select any nonempty subset, including only `fixed_first`; comparison columns are populated only for references selected in that run. Default models are LLaMA-2-7B/13B; default tasks are CNN/DM (64 tokens) and both GSM8K budgets. Use `--cnndm-max-new-tokens 64 512` for both CNN/DM budgets. HumanEval is opt-in with `--stage evaluate --tasks humaneval`; pair `--models` with `--code-models` when overriding sizes. Only one GPU and one inference subprocess run at a time. No installation, warm-up or GPU smoke test is performed.
-
-Development uses train splits, excludes the one CNN/DM demonstration and five GSM8K demonstrations, and never uses HumanEval for tuning. Evaluation uses the existing test protocol. Each process starts fresh; method order rotates across seeds. Each run creates a new `_local/runs/mask_search_<timestamp>/` with original Git archives, executed source diffs, driver copies and hashes. Source edits are applied only inside those snapshots. Use `--prepare-only` to inspect them without inference.
-
-**Controlled comparisons:** all five research policies use an incumbent plus seven unique seeded random masks from SWIFT's layer-skipping search space, keeping the first/last layers. They use a local RNG, not generation RNG. Unlike original SWIFT, this controlled proposal pool does not use Bayesian optimization; only objective/allocation/window change among the five policies. Incumbents can diverge after different selections, so only the random proposals and proposal seeds are paired, not the entire evolving pool. Candidate/profile order is randomized reproducibly.
-
-Each race uses 192 replay input tokens: uniform = `8*(23+1)`; halving = `8*(7+1)+4*(15+1)+2*(31+1)`. Eight one-token draft profiles plus one six-token dense verification profile make **206 candidate-input units** per race. Default per-request budget 824 permits at most four races, separated by at least 32 committed tokens. This matches evaluated token units, not forward-call counts or GPU time; all actual profiling/copying/synchronization/selection costs remain inside inference timing. `--search-time-budget-ms` is an additional soft limit checked between races; an in-progress race is not interrupted. No early stop from a high in-window score is used in these research policies.
-
-The cost objective is an explicitly approximate linear prefix-yield/latency proxy with horizon 5, inspired by cost-aware selection in KnapSpec. It is not measured SWIFT tree M or tree throughput. All policies pay the same profiling probes, including match-only variants. Fixed-window variants replay the first generated context; refresh uses the latest verified window with correctly cropped scratch target KV. No model weights, target acceptance rules or committed tokens are modified.
-
-`diagnose` additionally pays for independent linear draft/full-target-verification probes of eight masks on the first race of the first four requests per process. These use private KV and never commit probe outputs. **Diagnostic speedups are not benchmark claims.** Per-method `*.diagnostics.csv` pairs proxy scores with linear probes and later observed tree M. Partial scores for halving losers have fewer evaluated labels, recorded explicitly. JSONL `forward_metrics.search_events` contains masks, context offsets, resource counts and post-selection observations. Those are research artifacts, not terminal text logs.
-
-`results.csv` reports actual tree M/alpha, macro/global speeds, latency ratios, request p50/p95, mismatches, cache/embedding costs, candidate-token units, search wall time and diagnostic time; GSM8K also includes accuracy/missing/cap/paired correctness. Search/diagnostic time overlaps optimization wall time and must not be added twice. The post-selection host-time proxy subtracts search wall time; synchronized request wall time remains the authoritative end-to-end measurement. No speedup or novelty has been established by implementation or CPU checks alone.
+The five controlled policies (`match_uniform`, `cost_uniform`, `match_halving`, `cost_halving`, `cost_halving_refresh`) were evaluated on `research/swift-mask-search` and lost to SWIFT; they are removed from this branch. Code, protocol and results remain on that branch, in `EXPERIMENT_LOG.md` and in `_local/runs`.
 
 ### Re-score saved HumanEval tokens without GPU inference
 

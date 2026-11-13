@@ -29,6 +29,11 @@ from research_utils import read_records, validate_pair  # noqa: E402
 REFERENCES = ('baseline', 'swift', 'fixed_first', 'adaptive', 'prefill_cache', 'skipbook')
 
 
+def is_reference(name):
+    """Reference methods plus named SkipBook ablations (skipbook_k1, skipbook_nodrift, ...)."""
+    return name in REFERENCES or name.startswith('skipbook_')
+
+
 # ---------------------------------------------------------------- statistics
 def rankdata(values):
     order = sorted(range(len(values)), key=lambda i: values[i])
@@ -118,7 +123,7 @@ def headroom(task, methods):
     for records in methods.values():
         validate_pair(records, anchor)
     views = {name: [request_view(r) for r in records] for name, records in masks.items()}
-    refs = {name: [request_view(r) for r in methods[name]] for name in REFERENCES if name in methods}
+    refs = {name: [request_view(r) for r in methods[name]] for name in methods if is_reference(name)}
     ar = mean_speed(refs['baseline']) if 'baseline' in refs else None
     n = len(anchor)
     names = [k for k in views if not k.endswith('_rep')]
@@ -156,18 +161,16 @@ def headroom(task, methods):
             abs(a - b) / ((a + b) / 2) for a, b in zip(speed[k], speed[k + '_rep'])) / math.sqrt(2)
         out['output_mismatch_replicate'] = sum(
             a['tokens'] != b['tokens'] for a, b in zip(views[k], views[k + '_rep']))
-    for name in ('prefill_cache', 'skipbook'):
-        if name not in methods:
-            continue
+    for name in [n for n in refs if n == 'prefill_cache' or n.startswith('skipbook')]:
         metrics = [r.get('forward_metrics', {}) for r in methods[name]]
         out[f'{name}_vs_oracle_request'] = mean_speed(refs[name]) / statistics.fmean(oracle)
         out[f'{name}_vs_best_single'] = mean_speed(refs[name]) / per_mask[best]
         out[f'{name}_key_seconds'] = sum(m.get('embedding_seconds', 0) for m in metrics)
         out[f'{name}_hit_rate'] = statistics.fmean(bool(m.get('cache_hit')) for m in metrics)
-        if name == 'skipbook':
-            out['skipbook_explore_share'] = statistics.fmean(m.get('skipbook_mode') == 'explore' for m in metrics)
-            out['skipbook_contexts'] = len({m.get('skipbook_context') for m in metrics})
-            out['skipbook_drift_events'] = sum(bool(m.get('skipbook_drift')) for m in metrics)
+        if name.startswith('skipbook'):
+            out[f'{name}_explore_share'] = statistics.fmean(m.get('skipbook_mode') == 'explore' for m in metrics)
+            out[f'{name}_contexts'] = len({m.get('skipbook_context') for m in metrics})
+            out[f'{name}_drift_events'] = sum(bool(m.get('skipbook_drift')) for m in metrics)
     if 'fixed_first' in refs:
         ff = mean_speed(refs['fixed_first'])
         out['oracle_request_gain_vs_fixed_first'] = statistics.fmean(oracle) / ff - 1

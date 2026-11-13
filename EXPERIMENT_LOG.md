@@ -323,3 +323,23 @@ khai thác ngay mask tốt; mask được chọn đang hoạt động ở draft 
 optimizer stream khi miss. Prepare-only trên snapshot Git thật và parse mọi file đã patch.
 **Chưa có kết quả GPU.** Rủi ro: few-shot chung có thể gom CNN và GSM8K vào một context
 (theo dõi `cache_similarity`, thử `--sb-key-pool last64`); reward theo request nhiễu do độ dài.
+
+## 2026-11-13 — Dọn nhánh research/skipbook: bỏ policy đã fail, thêm ablation có tên
+
+- Xoá `model/mask_search.py` và 5 policy `match_uniform`, `cost_uniform`, `match_halving`,
+  `cost_halving`, `cost_halving_refresh` khỏi runner (đã thua SWIFT trên nhánh
+  research/swift-mask-search; code và kết quả cũ giữ nguyên ở nhánh đó và `_local/runs`).
+  Bỏ các hook replay/probe, `--search-token-budget/interval/time-budget-ms`,
+  `--diagnostic-samples` và `*.diagnostics.csv`. `fixed_first` không phụ thuộc phần đã xoá.
+- `--methods` mặc định: `baseline swift fixed_first prefill_cache skipbook`.
+- Ablation có tên, chạy chung một lệnh và một `results.csv`: `skipbook_k1` (1 arm),
+  `skipbook_nodrift` (tắt Page-Hinkley), `skipbook_onectx` (threshold −1, một context chung),
+  `skipbook_q64` (key từ 64 token cuối). `results.csv` thêm `skipbook_explore_share`,
+  `skipbook_contexts`, `skipbook_drift_events`; `analyze_headroom.py` nhận các tên `skipbook_*`.
+- Search protocol ghi `skipbook_v1`; thư mục run mặc định `_local/runs/skipbook_<timestamp>`.
+- Readme: một mục "Chạy trên H100" theo thứ tự E1 trộn → đơn domain → ablation → oracle E2.
+
+Kiểm tra CPU đã qua: prepare-only trên snapshot Git thật (main + AdaptiveCache) với
+baseline/swift/adaptive/fixed_first/prefill_cache/skipbook/ablation, parse mọi file đã patch;
+test ablation (đúng cờ `--sb-*` cho từng tên), summarize, skipbook, stream, analyze.
+**Chưa có kết quả GPU.**

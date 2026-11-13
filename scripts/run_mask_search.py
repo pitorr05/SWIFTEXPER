@@ -1,4 +1,4 @@
-"""Prepare immutable SWIFT snapshots and run controlled mask-search ablations."""
+"""Prepare immutable SWIFT snapshots and run SkipBook/PrefillCache experiments and ablations."""
 import argparse
 import csv
 from datetime import datetime, timezone
@@ -13,22 +13,31 @@ import sys
 SCRIPTS = Path(__file__).resolve().parent
 REPO = SCRIPTS.parent
 sys.path[:0] = [str(REPO), str(SCRIPTS / 'runtime')]
-from model.mask_search import POLICIES, PROTOCOL
 from run_experiments import (export_source, code_sources, save_changes, check_environment,
                              run, note, score_records, compare_scores)
 from source_patches import prepare, replace
 from research_utils import (aggregate, compare_aggregates, read_records, validate_pair, write_json)
 
+PROTOCOL = 'skipbook_v1'
 BOOK_METHODS = ('prefill_cache', 'skipbook')
-METHODS = ('baseline', 'swift', *POLICIES, 'adaptive', 'fixed_first', 'fixed_mask', *BOOK_METHODS)
+# Named SkipBook ablations: one runner invocation, one results.csv, comparable rows.
+ABLATIONS = {
+    'skipbook_k1': {'sb_max_arms': 1},          # no bandit: one mask per context
+    'skipbook_nodrift': {'sb_drift': 'off'},    # no Page-Hinkley re-exploration
+    'skipbook_onectx': {'sb_threshold': -1.0},  # no prompt contexts: one global book
+    'skipbook_q64': {'sb_key_pool': 'last64'},  # key from the last 64 prompt tokens only
+}
+RESEARCH_METHODS = ('fixed_first', 'fixed_mask', *BOOK_METHODS, *ABLATIONS)
+METHODS = ('baseline', 'swift', 'adaptive', *RESEARCH_METHODS)
+DEFAULT_METHODS = ('baseline', 'swift', 'fixed_first', 'prefill_cache', 'skipbook')
+SB_KEYS = ('sb_threshold', 'sb_max_arms', 'sb_gamma', 'sb_ucb_c', 'sb_drift', 'sb_key_pool')
 FIELDS = ['metric_protocol', 'search_protocol', 'stage', 'split', 'seed', 'dataset', 'model',
           'method', 'samples', 'tokens', 'inference_seconds', 'tokens_per_second',
           'global_tokens_per_second', 'speedup_vs_baseline', 'speedup_vs_swift',
           'inference_time_speedup_vs_swift', 'mean_accepted_length', 'acceptance_rate',
           'token_mismatch_vs_baseline', 'token_mismatch_vs_swift', 'p50_request_seconds',
-          'p95_request_seconds', 'cache_hit_rate', 'embedding_seconds',
-          'candidate_input_tokens', 'mask_search_seconds', 'optimization_host_seconds',
-          'diagnostic_probe_seconds', 'search_event_count', 'accuracy', 'correct',
+          'p95_request_seconds', 'cache_hit_rate', 'embedding_seconds', 'optimization_host_seconds',
+          'skipbook_explore_share', 'skipbook_contexts', 'skipbook_drift_events', 'accuracy', 'correct',
           'missing_answer_rate', 'token_limit_rate', 'correct_to_wrong_vs_baseline',
           'wrong_to_correct_vs_baseline', 'pass_at_1', 'max_new_tokens',
           'stream_order_seed', 'mix_ratio', 'fixed_mask']
@@ -101,14 +110,9 @@ def patch_research(root):
     parser.add_argument('--sb-min-pulls', type=int, default=3)
     parser.add_argument('--sb-drift', choices=['on', 'off'], default='on')
     parser.add_argument('--sb-key-pool', default='mean')
-    parser.add_argument('--search-policy', choices=['fixed_first', 'fixed_mask', 'prefill_cache', 'skipbook', 'match_uniform', 'cost_uniform', 'match_halving', 'cost_halving', 'cost_halving_refresh'], required=True)
-    parser.add_argument('--search-token-budget', type=int, default=824)
-    parser.add_argument('--search-interval', type=int, default=32)
-    parser.add_argument('--search-time-budget-ms', type=float, default=0)
-    parser.add_argument('--diagnostic-samples', type=int, default=0)
+    parser.add_argument('--search-policy', choices=['fixed_first', 'fixed_mask', 'prefill_cache', 'skipbook'], required=True)
     args = parser.parse_args()''')
-    text = replace(text, '    run_eval(', '''    search = None
-    frozen_stream = args.search_policy == 'fixed_mask'
+    text = replace(text, '    run_eval(', '''    frozen_stream = args.search_policy == 'fixed_mask'
     if frozen_stream:
         import json as _json
         _mask = _json.loads(args.fixed_mask)
@@ -134,41 +138,18 @@ def patch_research(root):
         initialize_swift = book.hook_initialize(swift_verify, swift_draft)
         optimizer = book.optimizer
         forward_entry = book.wrap(swift_forward)
-    elif args.search_policy not in ('fixed_first', 'fixed_mask'):
-        from model.mask_search import MaskSearch
-        search = MaskSearch(model, args.search_policy, seed=args.seed,
-                            token_budget=args.search_token_budget, interval=args.search_interval,
-                            time_budget_ms=args.search_time_budget_ms,
-                            diagnostic_samples=args.diagnostic_samples)
-        swift_optimization = search.optimize
     fixed_first_seen = False
 
     run_eval(''')
     text = replace(text, '    begin_request(statistics)', '''    begin_request(statistics)
     global fixed_first_seen
-    if search is not None:
-        search.begin_request(swift_forward.request_context, statistics)
-    elif (fixed_first_seen and args.search_policy == 'fixed_first') or frozen_stream:
+    if (fixed_first_seen and args.search_policy == 'fixed_first') or frozen_stream:
         statistics['optimization'] = False''')
-    text = replace(text, '        if tokenizer.eos_token_id in input_ids[0, input_len:].tolist() or new_token_num >= max_new_tokens:',
-                   '        if search is not None:\n'
-                   '            search.observe_commit(accept_length_tree, len(top1_prob))\n'
-                   '        if tokenizer.eos_token_id in input_ids[0, input_len:].tolist() or new_token_num >= max_new_tokens:')
-    text = replace(text, '                    utility=utility)',
-                   '                    utility=utility,\n'
-                   '                    **({"verified_past_key_values_data": past_key_values_data,\n'
-                   '                        "verified_current_length_data": current_length_data} if search is not None else {}))')
-    text = replace(text, '                and idx % statistics["opt_interval"] == 0):',
-                   '                and idx % statistics["opt_interval"] == 0\n'
-                   '                and (search is None or search.ready(new_token_num, statistics))):')
     text = replace(text, '    return input_ids, new_token_num, idx + 1, accept_length_list, draft_token_num',
-                   '    if search is not None:\n'
-                   '        swift_forward.last_metrics.update(search.metrics())\n'
                    '    fixed_first_seen = True\n'
                    '    return input_ids, new_token_num, idx + 1, accept_length_list, draft_token_num')
     text = replace(text, '        forward_func=swift_forward,', '        forward_func=forward_entry,')
     write_text(path, text)
-    shutil.copyfile(REPO / 'model/mask_search.py', root / 'model/mask_search.py')
     shutil.copyfile(REPO / 'model/skipbook.py', root / 'model/skipbook.py')
 
 
@@ -191,23 +172,34 @@ def prepare_sources(args, output):
     save_changes(research, originals[str(swift)])
     write_json(research / 'RESEARCH_SOURCE.json', {
         'protocol': PROTOCOL,
-        'mask_search_sha256': hashlib.sha256((REPO/'model/mask_search.py').read_bytes()).hexdigest(),
-        'note': 'Only optimizer hook differs; original acceptance/model utility files are unchanged'})
-    compile((research/'model/mask_search.py').read_text(encoding='utf-8'), 'model/mask_search.py', 'exec')
+        'skipbook_sha256': hashlib.sha256((REPO/'model/skipbook.py').read_bytes()).hexdigest(),
+        'note': 'Only mask selection hooks differ; original acceptance/model utility files are unchanged'})
+    compile((research/'model/skipbook.py').read_text(encoding='utf-8'), 'model/skipbook.py', 'exec')
     return {'baseline': swift, 'swift': swift, 'adaptive': adaptive,
-            **{p: research for p in (*POLICIES, 'fixed_first', 'fixed_mask', *BOOK_METHODS)}}, sources
+            **{p: research for p in RESEARCH_METHODS}}, sources
 
 
 def method_instances(args):
-    """Expand fixed_mask into one process per bank entry; other methods map to themselves."""
+    """(name, policy, entry): fixed_mask expands per bank entry; ablations map to skipbook + overrides."""
     instances = []
     for method in args.methods:
-        if method != 'fixed_mask':
+        if method == 'fixed_mask':
+            instances += [('mask_'+entry['name'], method, entry) for entry in args.bank]
+        elif method in ABLATIONS:
+            instances.append((method, 'skipbook', {'sb': ABLATIONS[method]}))
+        else:
             instances.append((method, method, None))
-            continue
-        for entry in args.bank:
-            instances.append(('mask_'+entry['name'], method, entry))
     return instances
+
+
+def book_arguments(args, entry):
+    """--sb-* flags for a book method: runner defaults, overridden by a named ablation."""
+    values = {key: getattr(args, key) for key in SB_KEYS}
+    values.update((entry or {}).get('sb', {}))
+    command = []
+    for key in SB_KEYS:
+        command += ['--'+key.replace('_', '-'), values[key]]
+    return command
 
 
 def load_bank(path):
@@ -248,34 +240,6 @@ def percentile(values, probability):
     return values[lo] + (values[hi]-values[lo])*(x-lo)
 
 
-def write_diagnostics(folder, task, method, records):
-    """Export candidate rankings vs paid linear probes and subsequent tree segments."""
-    rows = []
-    for record in records:
-        for event_index,event in enumerate(record.get('forward_metrics',{}).get('search_events',[])):
-            latest = {item['candidate']: item for item in event['observations']}
-            for index,probe in enumerate(event['diagnostic']):
-                observation = latest[index]
-                rounds = event['future_rounds']
-                rows.append({'task_id':record['task_id'],'method':method,'event':event_index,'candidate':index,
-                             'checkpoint_tokens':event['checkpoint_tokens'],'context_offset':event['context_offset'],
-                             'mask':json.dumps(probe['mask'],sort_keys=True),
-                             'labels_evaluated':observation['labels'],'matchness':observation['matchness'],
-                             'prefix_yield_proxy':observation['prefix_yield_proxy'],
-                             'utility_proxy':observation['utility_proxy'],
-                             'linear_committed_tokens':probe['linear_committed_tokens'],
-                             'linear_tokens_per_second':probe['linear_tokens_per_second'],
-                             'probe_seconds':probe['seconds_including_copy'],
-                             'selected':probe['mask']==event['selected'],
-                             'selected_future_tree_M':event['future_committed_tokens']/rounds if rounds else None,
-                             'scope':'paid_linear_probe_not_tree_benchmark'})
-    if rows:
-        with open(folder/f'{task}.{method}.diagnostics.csv','x',encoding='utf-8',newline='') as stream:
-            writer=csv.DictWriter(stream,fieldnames=list(rows[0]))
-            writer.writeheader()
-            writer.writerows(rows)
-
-
 def summarize(folder, task, actual_task, model, count, seed, args, order_seed=None):
     records, summaries, metadata, manifests = {}, {}, [], []
     instances = method_instances(args)
@@ -304,7 +268,6 @@ def summarize(folder, task, actual_task, model, count, seed, args, order_seed=No
         for base in references:
             validate_pair(records[method], records[base])
         metrics = [r.get('forward_metrics', {}) for r in records[method]]
-        write_diagnostics(folder,task,method,records[method])
         summary = summaries[method]
         row = {k: summary[k] for k in ('metric_protocol','samples','tokens','inference_seconds',
                'tokens_per_second','global_tokens_per_second','mean_accepted_length','acceptance_rate',
@@ -314,7 +277,7 @@ def summarize(folder, task, actual_task, model, count, seed, args, order_seed=No
                    seed=seed, dataset=task, model=model, method=method,
                    max_new_tokens=metadata[0]['config']['max_new_tokens'],
                    stream_order_seed=order_seed, mix_ratio=metadata[0]['config'].get('mix_ratio'),
-                   fixed_mask=json.dumps({'attention': entry['attention'], 'mlp': entry['mlp']}) if entry else None,
+                   fixed_mask=json.dumps({'attention': entry['attention'], 'mlp': entry['mlp']}) if entry and 'attention' in entry else None,
                    p50_request_seconds=percentile(times,.5), p95_request_seconds=percentile(times,.95))
         for base in references:
             ratio = compare_aggregates(summary, summaries[base])
@@ -323,9 +286,10 @@ def summarize(folder, task, actual_task, model, count, seed, args, order_seed=No
                 row['inference_time_speedup_vs_swift'] = ratio['inference_time_speedup']
             row['token_mismatch_vs_'+base] = sum(a['output_token_ids'] != b['output_token_ids']
                                                 for a,b in zip(records[method], records[base]))
-        for key in ('candidate_input_tokens','mask_search_seconds','diagnostic_probe_seconds'):
-            row[key] = sum(m.get(key,0) for m in metrics)
-        row['search_event_count'] = sum(len(m.get('search_events',[])) for m in metrics)
+        if any('skipbook_mode' in m for m in metrics):
+            row['skipbook_explore_share'] = sum(m.get('skipbook_mode') == 'explore' for m in metrics)/len(metrics)
+            row['skipbook_contexts'] = len({m.get('skipbook_context') for m in metrics})
+            row['skipbook_drift_events'] = sum(bool(m.get('skipbook_drift')) for m in metrics)
         if method == 'baseline':
             row['acceptance_rate'] = None
         if gsm_scores:
@@ -378,13 +342,11 @@ def main():
     parser.add_argument('--mask-bank',type=Path,help='D2: JSON list of {name, attention, mlp} for fixed_mask')
     parser.add_argument('--gsm8k-profiles',nargs='+',choices=['paper64','quality512'],default=['paper64','quality512'])
     parser.add_argument('--cnndm-max-new-tokens',nargs='+',type=int,choices=[64,512],default=[64])
-    parser.add_argument('--methods',nargs='+',choices=METHODS,default=[m for m in METHODS if m != 'fixed_mask'])
+    parser.add_argument('--methods',nargs='+',choices=METHODS,default=list(DEFAULT_METHODS),
+                        help='Ablations: ' + ', '.join(f'{k} {v}' for k, v in ABLATIONS.items()))
     parser.add_argument('--seeds',nargs='+',type=int,default=[2024])
     parser.add_argument('--data-seed',type=int,default=2024)
     parser.add_argument('--data-num',type=int)
-    parser.add_argument('--search-token-budget',type=int,default=824)
-    parser.add_argument('--search-interval',type=int,default=32)
-    parser.add_argument('--search-time-budget-ms',type=float,default=0)
     parser.add_argument('--swift-ref',default='main')
     parser.add_argument('--adaptive-ref',default='origin/AdaptiveCache')
     parser.add_argument('--output-dir',type=Path)
@@ -407,20 +369,19 @@ def main():
     if ('fixed_mask' in args.methods) != (args.mask_bank is not None):
         parser.error('--mask-bank is required with, and only with, --methods fixed_mask')
     args.bank = load_bank(args.mask_bank) if args.mask_bank else []
-    if (args.data_num < 1 or args.search_token_budget < 206 or args.search_interval < 1
-            or not math.isfinite(args.search_time_budget_ms) or args.search_time_budget_ms < 0):
-        parser.error('Invalid positive count/search budget/interval or finite time budget')
+    if args.data_num < 1:
+        parser.error('--data-num must be positive')
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
-    output = (args.output_dir or REPO/'_local/runs'/f'mask_search_{stamp}').resolve()
+    output = (args.output_dir or REPO/'_local/runs'/f'skipbook_{stamp}').resolve()
     output.mkdir(parents=True,exist_ok=False)
     try:
         roots, sources = prepare_sources(args,output)
         config = {k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()}
         config.update(sources=sources,search_protocol=PROTOCOL,
-                      note='diagnose includes paid counterfactual probes; not a performance benchmark')
+                      note='diagnose uses train splits for development; report evaluate (test) numbers')
         write_json(output/'run_config.json',config)
         shutil.copytree(SCRIPTS,output/'driver/scripts',ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
-        shutil.copyfile(REPO/'model/mask_search.py',output/'driver/mask_search.py')
+        shutil.copyfile(REPO/'model/skipbook.py',output/'driver/skipbook.py')
         if args.prepare_only:
             write_json(output/'status.json',{'status':'prepared_only','inference_ran':False})
             note(f'PREPARED: {output}; no GPU inference.')
@@ -453,15 +414,11 @@ def main():
                         command += ['--optimization','--bayes','--skip-ratio',.45]
                     if method == 'adaptive':
                         command += ['--cache-enabled','--cache-clear','--cache-threshold',.85,'--cache-max-size',100]
-                    elif method in (*POLICIES,'fixed_first','fixed_mask',*BOOK_METHODS):
-                        command += ['--search-policy',method,'--search-token-budget',args.search_token_budget,
-                                    '--search-interval',args.search_interval,'--search-time-budget-ms',args.search_time_budget_ms,
-                                    '--diagnostic-samples',4 if args.stage == 'diagnose' and method in POLICIES else 0]
+                    elif method in RESEARCH_METHODS:
+                        command += ['--search-policy',method]
                     if method in BOOK_METHODS:
-                        command += ['--sb-threshold',args.sb_threshold,'--sb-max-arms',args.sb_max_arms,
-                                    '--sb-gamma',args.sb_gamma,'--sb-ucb-c',args.sb_ucb_c,
-                                    '--sb-drift',args.sb_drift,'--sb-key-pool',args.sb_key_pool]
-                    if entry is not None:
+                        command += book_arguments(args,entry)
+                    if method == 'fixed_mask':
                         command += ['--fixed-mask',json.dumps({'attention':entry['attention'],'mlp':entry['mlp']})]
                     note(f'{args.stage}: {model_id}/{task}/{name}, seed {seed}, order {order_seed}, N={count}')
                     run(command,roots[method])
@@ -470,7 +427,7 @@ def main():
         write_json(output/'status.json',{'status':'complete','inference_ran':True,'stage':args.stage,'rows':len(rows)})
         note(f'DONE: {output/"results.csv"}')
         if args.stage == 'diagnose':
-            note('Diagnose results include probes; do not report them as benchmark speedups.')
+            note('Diagnose runs use train splits; report --stage evaluate numbers in the paper.')
     except Exception as error:
         write_json(output/'failure.json',{'status':'failed','error':repr(error)})
         raise
